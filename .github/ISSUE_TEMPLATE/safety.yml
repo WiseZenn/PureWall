@@ -1,0 +1,40 @@
+name: Safety boundary question
+description: Ask a non-sensitive question about PureWall's documented safety boundaries.
+title: "[Safety]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post vulnerability details, proof-of-concept steps, secrets, personal paths, or destructive test evidence here.
+
+        Reports involving destructive file operations, registry writes, installer or uninstaller behavior, path traversal, or updater/signature verification must use a [GitHub private security advisory](https://github.com/WiseZenn/PureWall/security/advisories/new).
+
+        Use this form only for a public documentation correction or a non-sensitive clarification of the intended safety policy.
+
+  - type: dropdown
+    id: question-type
+    attributes:
+      label: Non-sensitive question type
+      options:
+        - Public safety documentation correction
+        - Safety-boundary clarification
+        - Non-sensitive hardening suggestion
+    validations:
+      required: true
+
+  - type: textarea
+    id: public-context
+    attributes:
+      label: Public, non-sensitive context
+      description: Describe the documentation or policy question only. Do not include reproduction or exploit details.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: private-report-check
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I confirm this contains no exploit details, secrets, personal paths, or destructive test evidence.
+          required: true

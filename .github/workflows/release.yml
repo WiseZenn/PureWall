@@ -1,0 +1,164 @@
+name: release
+
+# Privileged release automation. A pushed v* SemVer tag builds, signs, checksums,
+# and attests the Windows artifacts and creates ONLY a draft GitHub Release.
+# Manual dispatch is a dry-run: it builds and attests workflow artifacts but does not
+# create a GitHub Release unless the operator explicitly enables publishDraft.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publishDraft:
+        description: "Create a draft GitHub Release for the given tag (requires the tag to exist)."
+        type: boolean
+        required: false
+        default: false
+      tag:
+        description: "Tag name to build; used only when publishDraft is true."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  # Tag push -> the pushed tag. Manual dispatch -> the input tag, but only when the
+  # operator explicitly asked for a draft release. Empty on a manual dry-run, which
+  # makes tauri-action skip release creation and uploads entirely.
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || (github.event_name == 'workflow_dispatch' && inputs.publishDraft && inputs.tag) || '' }}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Manual dispatch with publishDraft must build the exact tag the draft is
+      # labeled with. Verify the tag exists on the remote and exists as a local
+      # ref before building; otherwise the draft could be labeled with a tag that
+      # never built this commit.
+      - name: Resolve and verify release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          if ('${{ github.event_name }}' -eq 'push') { exit 0 }
+          if (-not $env:RELEASE_TAG) { exit 0 }
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            Write-Error "PUREWALL_RELEASE_TAG must be a bare v<SemVer> tag, got: $env:RELEASE_TAG"
+            exit 1
+          }
+          git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Tag $env:RELEASE_TAG does not exist on origin; publishDraft requires an existing tag."
+            exit 1
+          }
+          git checkout "refs/tags/$env:RELEASE_TAG"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - run: npm ci
+
+      - name: Full npm audit
+        run: npm audit
+
+      - name: Typecheck
+        run: npx vue-tsc --noEmit
+
+      - name: Frontend unit tests
+        run: npm run test:unit
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Rust format
+        run: cargo fmt --check
+        working-directory: src-tauri
+
+      - name: Rust check
+        run: cargo check
+        working-directory: src-tauri
+
+      - name: Rust tests
+        run: cargo test
+        working-directory: src-tauri
+
+      - name: Rust clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: Validate PUREWALL_RELEASE_TAG against version declarations
+        env:
+          PUREWALL_RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: npm run verify:release
+
+      - name: Prepare signing configuration from secrets
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_TIMESTAMP_URL: ${{ secrets.WINDOWS_CERTIFICATE_TIMESTAMP_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ vars.TAURI_SIGNING_PUBLIC_KEY }}
+        run: powershell -ExecutionPolicy Bypass -File scripts/prepare-release-config.ps1
+
+      - name: Build bundles, sign, and create draft release when tagged
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --config src-tauri/tauri.release.generated.conf.json
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseDraft: true
+
+      - name: Verify Authenticode signature on every installer
+        shell: pwsh
+        run: |
+          $installers = Get-ChildItem -Path "src-tauri\target\release\bundle" -Recurse -File |
+            Where-Object { $_.Extension -in @('.msi', '.exe') }
+          if ($installers.Count -eq 0) {
+            throw "No MSI or EXE installers found to verify"
+          }
+          foreach ($installer in $installers) {
+            $signature = Get-AuthenticodeSignature -FilePath $installer.FullName
+            if ($signature.Status -ne 'Valid') {
+              throw "Authenticode signature not Valid for $($installer.Name): $($signature.Status)"
+            }
+            Write-Host "Authenticode Valid: $($installer.Name)"
+          }
+
+      - name: Collect release artifacts and write SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/collect-release-artifacts.ps1 `
+            -BundleRoot "src-tauri\target\release\bundle" `
+            -OutputDirectory "release-artifacts"
+
+      - name: Upload checksum file to the draft release
+        if: env.RELEASE_TAG != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$env:RELEASE_TAG" "release-artifacts\SHA256SUMS.txt" --repo WiseZenn/PureWall
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: release-artifacts
+          github-token: ${{ secrets.GITHUB_TOKEN }}

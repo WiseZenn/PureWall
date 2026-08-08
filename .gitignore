@@ -1,0 +1,55 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Tauri build
+src-tauri/target/
+release-artifacts/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.worktrees/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Local agent configuration
+/.agents/
+/.codex/
+/skills-lock.json
+
+# Language/tool caches
+**/__pycache__/
+*.py[cod]
+
+# Local registry-script residue
+src-tauri/$c/
+
+# Local browser QA evidence
+output/playwright/
+
+# Local agent config / caches
+.agents/
+.codex/
+scripts/__pycache__/
+*.pyc
+
+# Generated QA and signing residue
+/output/
+*.pfx
+*.pem
+*.key
+src-tauri/tauri.release.generated.conf.json
+
+
+# pi-subagents runtime state
+.pi-subagents/

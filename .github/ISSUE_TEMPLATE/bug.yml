@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible PureWall problem on Windows.
+title: "[Bug]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste vulnerability details, destructive reproduction steps, secrets, personal paths, or private user content into this public form.
+
+        If the problem could affect files, registry state, installers, path traversal, command execution, IPC, or update/signature verification, stop here and open a [GitHub private security advisory](https://github.com/WiseZenn/PureWall/security/advisories/new).
+
+  - type: dropdown
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: Select the Windows version where the problem occurs.
+      options:
+        - Windows 11
+        - Windows 10
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: input
+    id: purewall-version
+    attributes:
+      label: PureWall version or commit
+      description: Provide the release version, commit SHA, or branch name you tested.
+      placeholder: "0.1.0 or 3f24fe0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste only relevant evidence. Redact user names, personal paths, wallpaper file names, tokens, and other private data before posting.
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I have removed personal paths and private user content from this public report.
+          required: true
+        - label: This report does not contain exploit details or secret material. Security-sensitive reports go through a private advisory.
+          required: true
