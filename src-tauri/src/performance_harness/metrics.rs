@@ -1,0 +1,372 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use sha2::{Digest, Sha256};
+
+use super::protocol::{EnvironmentFingerprint, ScenarioSamples};
+
+const WORKING_SET_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const DERIVATIVE_CONFIG: &str =
+    "derivatives:thumbnail=thumb-512-catmullrom-q88,512,88;preview=preview-1440-lanczos-q92,1440,92";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunMetadata {
+    pub(crate) git_commit: String,
+    pub(crate) generated_at_utc: String,
+    pub(crate) environment: EnvironmentFingerprint,
+}
+
+pub(crate) fn measure_operation<T>(
+    sample_count: usize,
+    operation: impl FnMut(usize) -> Result<T>,
+) -> Result<(ScenarioSamples, T)> {
+    measure_operation_validated(sample_count, operation, |_, _| Ok(()))
+}
+
+pub(crate) fn measure_operation_validated<T>(
+    sample_count: usize,
+    mut operation: impl FnMut(usize) -> Result<T>,
+    mut validate: impl FnMut(usize, &T) -> Result<()>,
+) -> Result<(ScenarioSamples, T)> {
+    ensure!(sample_count > 0, "sample count must be positive");
+    let sampler = WorkingSetSampler::start()?;
+    let measured: Result<(Vec<u64>, T)> = (|| {
+        let mut elapsed_micros = Vec::with_capacity(sample_count);
+        let mut final_value = None;
+        for sample_index in 0..sample_count {
+            drop(final_value.take());
+            let started = Instant::now();
+            let value = operation(sample_index)?;
+            elapsed_micros.push(micros_u64(started.elapsed()));
+            validate(sample_index, &value)?;
+            final_value = Some(value);
+        }
+        Ok((
+            elapsed_micros,
+            final_value.context("measurement produced no value")?,
+        ))
+    })();
+    let peak_working_set_bytes = sampler.finish()?;
+    let (elapsed_micros, final_value) = measured?;
+    Ok((
+        ScenarioSamples::from_elapsed_micros(elapsed_micros, peak_working_set_bytes)?,
+        final_value,
+    ))
+}
+
+pub(crate) fn run_with_deadline<T, F>(timeout: Duration, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    ensure!(
+        timeout > Duration::ZERO,
+        "performance scenario timeout must be positive"
+    );
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("purewall-performance-scenario".into())
+        .spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(operation));
+            let _ = sender.send(outcome);
+        })
+        .context("spawn performance scenario worker")?;
+
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(result)) => {
+            worker
+                .join()
+                .map_err(|_| anyhow!("performance scenario worker panicked"))?;
+            result
+        }
+        Ok(Err(_)) => {
+            let _ = worker.join();
+            bail!("performance scenario worker panicked")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            drop(worker);
+            bail!(
+                "performance scenario timed out after {} ms",
+                timeout.as_millis()
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            bail!("performance scenario worker disconnected before sending a result")
+        }
+    }
+}
+
+pub(crate) fn collect_run_metadata() -> Result<RunMetadata> {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("Cargo manifest directory has no repository parent")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("read performance harness Git commit")?;
+    ensure!(
+        output.status.success(),
+        "git rev-parse HEAD failed with status {}",
+        output.status
+    );
+    let git_commit = String::from_utf8(output.stdout)
+        .context("git rev-parse HEAD was not UTF-8")?
+        .trim()
+        .to_string();
+    ensure!(
+        git_commit.len() == 40 && git_commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "performance Git commit must be exactly 40 ASCII hexadecimal characters"
+    );
+
+    Ok(RunMetadata {
+        git_commit,
+        generated_at_utc: chrono::Utc::now().to_rfc3339(),
+        environment: EnvironmentFingerprint {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            cpu: std::env::var("PROCESSOR_IDENTIFIER")
+                .unwrap_or_else(|_| "unknown-processor".to_string()),
+            logical_cores: thread::available_parallelism()
+                .context("read logical processor count")?
+                .get(),
+            installed_memory_bytes: installed_memory_bytes()?,
+            rust_profile: if cfg!(debug_assertions) {
+                "debug".to_string()
+            } else {
+                "release".to_string()
+            },
+            config_digest: configuration_digest(),
+        },
+    })
+}
+
+fn configuration_digest() -> String {
+    let input = format!(
+        "scenario-contract={};workingset-ms={};{};scan-depth={};scan-images={};scan-entries={};{};{}",
+        super::protocol::SCENARIO_CONTRACT_VERSION,
+        WORKING_SET_SAMPLE_INTERVAL.as_millis(),
+        super::scenarios::performance_config_descriptor(),
+        crate::scanner::MAX_SCAN_DEPTH,
+        crate::scanner::MAX_SCAN_IMAGES,
+        crate::scanner::MAX_SCAN_ENTRIES,
+        crate::media_queue::MediaJobQueue::performance_config_descriptor(),
+        DERIVATIVE_CONFIG,
+    );
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+
+struct WorkingSetSampler {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<u64>>>,
+}
+
+impl WorkingSetSampler {
+    fn start() -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (first_sender, first_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("purewall-working-set-sampler".into())
+            .spawn(move || {
+                let first = current_working_set_bytes();
+                let _ = first_sender.send(
+                    first
+                        .as_ref()
+                        .map(|value| *value)
+                        .map_err(|error| error.to_string()),
+                );
+                let mut peak = first?;
+                while !worker_stop.load(Ordering::Acquire) {
+                    thread::sleep(WORKING_SET_SAMPLE_INTERVAL);
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    peak = peak.max(current_working_set_bytes()?);
+                }
+                Ok(peak)
+            })
+            .context("spawn working-set sampler")?;
+
+        match first_receiver.recv() {
+            Ok(Ok(_)) => Ok(Self {
+                stop,
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                stop.store(true, Ordering::Release);
+                let _ = worker.join();
+                Err(anyhow!(error)).context("sample initial current working set")
+            }
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                let _ = worker.join();
+                Err(error).context("receive initial current working set")
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<u64> {
+        self.stop.store(true, Ordering::Release);
+        self.worker
+            .take()
+            .context("working-set sampler worker is missing")?
+            .join()
+            .map_err(|_| anyhow!("working-set sampler panicked"))?
+    }
+}
+
+impl Drop for WorkingSetSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(windows)]
+fn current_working_set_bytes() -> Result<u64> {
+    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()
+            .try_into()
+            .context("process memory counter size does not fit in u32")?,
+        ..Default::default()
+    };
+    let success =
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    ensure!(success.as_bool(), "K32GetProcessMemoryInfo failed");
+    counters
+        .WorkingSetSize
+        .try_into()
+        .context("current working set does not fit in u64")
+}
+
+#[cfg(not(windows))]
+fn current_working_set_bytes() -> Result<u64> {
+    bail!("current working-set sampling is supported only on Windows")
+}
+
+#[cfg(windows)]
+fn installed_memory_bytes() -> Result<u64> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>()
+            .try_into()
+            .context("memory status size does not fit in u32")?,
+        ..Default::default()
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status) }.context("GlobalMemoryStatusEx failed")?;
+    Ok(status.ullTotalPhys)
+}
+
+#[cfg(not(windows))]
+fn installed_memory_bytes() -> Result<u64> {
+    bail!("installed-memory sampling is supported only on Windows")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn measurement_has_samples_percentiles_and_working_set() {
+        let (samples, value) = measure_operation(3, |_| Ok(vec![7_u8; 64 * 1024].len())).unwrap();
+        assert_eq!(value, 64 * 1024);
+        assert_eq!(samples.elapsed_micros.len(), 3);
+        assert!(samples.peak_working_set_bytes > 0);
+        assert!(samples.p95_micros >= samples.median_micros);
+    }
+
+    #[test]
+    fn deadline_returns_a_stable_timeout_error() {
+        let error = run_with_deadline(Duration::from_millis(10), || {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "performance scenario timed out after 10 ms"
+        );
+    }
+
+    #[test]
+    fn deadline_maps_success_and_worker_panic_explicitly() {
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(1), || Ok::<_, anyhow::Error>(7)).unwrap(),
+            7
+        );
+
+        let error = run_with_deadline(Duration::from_secs(1), || -> anyhow::Result<()> {
+            panic!("sentinel deadline panic")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "performance scenario worker panicked");
+    }
+
+    #[test]
+    fn run_metadata_has_strict_comparable_fingerprints() {
+        let metadata = collect_run_metadata().unwrap();
+        assert_eq!(metadata.git_commit.len(), 40);
+        assert!(metadata
+            .git_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(chrono::DateTime::parse_from_rfc3339(&metadata.generated_at_utc).is_ok());
+        assert!(!metadata.environment.os.is_empty());
+        assert!(!metadata.environment.arch.is_empty());
+        assert!(!metadata.environment.cpu.is_empty());
+        assert!(metadata.environment.logical_cores > 0);
+        assert!(metadata.environment.installed_memory_bytes > 0);
+        assert_eq!(metadata.environment.config_digest.len(), 64);
+        assert!(metadata
+            .environment
+            .config_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn dropping_a_sampler_signals_its_worker_to_stop() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&stop);
+        let worker = std::thread::spawn({
+            let worker_stop = Arc::clone(&stop);
+            move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                Ok(1)
+            }
+        });
+        let sampler = WorkingSetSampler {
+            stop: Arc::clone(&stop),
+            worker: Some(worker),
+        };
+
+        drop(sampler);
+        let stopped = observed.load(Ordering::Acquire);
+        if !stopped {
+            observed.store(true, Ordering::Release);
+        }
+        assert!(stopped, "dropping a sampler must stop its worker");
+    }
+}

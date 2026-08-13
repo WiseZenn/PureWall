@@ -3,6 +3,8 @@ mod compare;
 #[cfg_attr(not(test), allow(dead_code))]
 mod dataset;
 #[cfg_attr(not(test), allow(dead_code))]
+mod metrics;
+#[cfg_attr(not(test), allow(dead_code))]
 mod owned_temp;
 #[cfg_attr(not(test), allow(dead_code))]
 mod protocol;

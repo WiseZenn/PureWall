@@ -5,18 +5,46 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 
 use super::dataset::GeneratedDataset;
+use super::metrics::{measure_operation_validated, run_with_deadline};
 use super::owned_temp::OwnedRunRoot;
 use super::protocol::{CacheState, RunStatus, ScenarioRecord, ScenarioSamples};
 use crate::db::{
     Database, Stats, WallpaperEntry, WallpaperPage, WatchedFolderSummary, DEFAULT_TAG_COLOR,
 };
+use crate::media_queue::{
+    MediaJobKind, MediaJobQueue, MediaNeeds, MediaPriority, MediaQueueSnapshot,
+};
 use crate::scanner::{scan_files, scan_folder, ImageInfo};
+use crate::thumbnails::{DerivativePaths, ThumbnailCache};
 use crate::ReconciliationOutcome;
 
 const SOURCE_LABEL: &str = "mounted";
 const PAGE_LIMIT: i64 = 120;
 const TAG_NAME: &str = "风景";
 const COLLECTION_NAME: &str = "Benchmark Collection";
+const MEDIA_PATH_COUNT: usize = 36;
+const ACTIVE_CLAIM_THUMBNAILS: usize = 256;
+const SCENARIO_IDS: [&str; 19] = [
+    "scan.full",
+    "import.atomic",
+    "reconcile.no-change",
+    "reconcile.incremental",
+    "reconcile.recovery",
+    "startup.open-first-page-stats",
+    "query.page.first",
+    "query.page.deep",
+    "query.search.unicode",
+    "query.search.none",
+    "query.filter.tag",
+    "query.filter.collection",
+    "query.sort.plays",
+    "playback.next.single",
+    "playback.next.multi",
+    "media.thumbnail.cold",
+    "media.thumbnail.warm",
+    "media.preview.cold",
+    "media.preview.active-claim",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SamplePolicy {
@@ -47,17 +75,17 @@ fn measure_each_sample<T>(
     count: usize,
     mut operation: impl FnMut(usize) -> Result<T>,
     mut consume: impl FnMut(usize, &T) -> Result<()>,
-) -> Result<Vec<u64>> {
-    ensure!(count > 0, "sample count must be positive");
-    let mut samples = Vec::with_capacity(count);
-    for sample_index in 0..count {
-        let started = std::time::Instant::now();
-        let value = operation(sample_index)?;
-        samples.push(started.elapsed().as_micros().try_into().unwrap_or(u64::MAX));
-        consume(sample_index, &value)?;
-        drop(value);
-    }
+) -> Result<ScenarioSamples> {
+    let (samples, value) = measure_operation_validated(count, &mut operation, &mut consume)?;
+    drop(value);
     Ok(samples)
+}
+
+pub(crate) fn performance_config_descriptor() -> String {
+    format!(
+        "scenarios={};ci-heavy=1;ci-short=3;ci-timeout-ms=60000;standard-heavy=3;standard-short=20;standard-timeout-ms=900000;media-paths={MEDIA_PATH_COUNT};active-claim-thumbnails={ACTIVE_CLAIM_THUMBNAILS}",
+        SCENARIO_IDS.join(",")
+    )
 }
 
 struct LibrarySample {
@@ -176,12 +204,13 @@ pub(crate) fn run_library_scenarios(
             &no_unavailable,
         )?;
     }
-    records.push(record(
+    records.push(record_with_database(
         "import.atomic",
         true,
         import_samples,
         total_u64,
         usize_to_u64(imported_count, "imported image count")?,
+        &libraries[0].database_path,
     )?);
 
     for library in &mut libraries {
@@ -221,12 +250,13 @@ pub(crate) fn run_library_scenarios(
         .database
         .get_wallpapers_page("all", "created", "", 0, 1)?
         .total;
-    records.push(record(
+    records.push(record_with_database(
         "reconcile.no-change",
         true,
         no_change_samples,
         total_u64,
         i64_to_u64(no_change_count, "no-change available count")?,
+        &libraries[0].database_path,
     )?);
 
     let mutations = dataset.apply_incremental_mutations()?;
@@ -285,12 +315,13 @@ pub(crate) fn run_library_scenarios(
         .database
         .get_wallpapers_page("all", "created", "", 0, 1)?
         .total;
-    records.push(record(
+    records.push(record_with_database(
         "reconcile.incremental",
         true,
         incremental_samples,
         usize_to_u64(incremental_expected, "incremental expected count")?,
         i64_to_u64(incremental_count, "incremental available count")?,
+        &libraries[0].database_path,
     )?);
 
     let recovered = dataset.recover_removed()?;
@@ -345,12 +376,13 @@ pub(crate) fn run_library_scenarios(
         .database
         .get_wallpapers_page("all", "created", "", 0, 1)?
         .total;
-    records.push(record(
+    records.push(record_with_database(
         "reconcile.recovery",
         true,
         recovery_samples,
         usize_to_u64(recovery_expected, "recovery expected count")?,
         i64_to_u64(recovery_count, "recovery available count")?,
+        &libraries[0].database_path,
     )?);
 
     let mut primary = libraries.remove(0);
@@ -400,12 +432,13 @@ pub(crate) fn run_library_scenarios(
         },
     )?;
     let startup_total = startup_total.context("startup produced no page total")?;
-    records.push(record(
+    records.push(record_with_database(
         "startup.open-first-page-stats",
         true,
         startup_samples,
         usize_to_u64(recovery_expected, "startup expected count")?,
         i64_to_u64(startup_total, "startup page total")?,
+        &database_path,
     )?);
 
     let database = Database::new(&database_path)
@@ -427,12 +460,13 @@ pub(crate) fn run_library_scenarios(
         },
     )?;
     let first_total = first_total.context("first-page query produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.page.first",
         true,
         first_samples,
         usize_to_u64(recovery_expected, "first-page expected total")?,
         i64_to_u64(first_total, "first-page total")?,
+        &database_path,
     )?);
 
     let deep_offset = (usize_to_i64(recovery_expected, "deep page total")? - PAGE_LIMIT).max(0);
@@ -446,12 +480,13 @@ pub(crate) fn run_library_scenarios(
         },
     )?;
     let deep_total = deep_total.context("deep-page query produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.page.deep",
         true,
         deep_samples,
         usize_to_u64(recovery_expected, "deep-page expected total")?,
         i64_to_u64(deep_total, "deep-page total")?,
+        &database_path,
     )?);
 
     let mut unicode_total = None;
@@ -472,7 +507,7 @@ pub(crate) fn run_library_scenarios(
         "Unicode search",
     )?;
     let unicode_total = unicode_total.context("Unicode search produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.search.unicode",
         true,
         unicode_samples,
@@ -481,6 +516,7 @@ pub(crate) fn run_library_scenarios(
             "Unicode search expected count",
         )?,
         i64_to_u64(unicode_total, "Unicode search total")?,
+        &database_path,
     )?);
 
     let mut none_total = None;
@@ -501,12 +537,13 @@ pub(crate) fn run_library_scenarios(
         },
     )?;
     let none_total = none_total.context("absent search produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.search.none",
         true,
         none_samples,
         0,
         i64_to_u64(none_total, "absent search total")?,
+        &database_path,
     )?);
 
     let tag_filter = format!("tag:{}", fixture.tag_id);
@@ -528,12 +565,13 @@ pub(crate) fn run_library_scenarios(
         "tag filter",
     )?;
     let tag_total = tag_total.context("tag-filter query produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.filter.tag",
         true,
         tag_samples,
         usize_to_u64(fixture.tagged.len(), "tag-filter expected count")?,
         i64_to_u64(tag_total, "tag-filter total")?,
+        &database_path,
     )?);
 
     let collection_filter = format!("collection:{}", fixture.collection_id);
@@ -555,12 +593,13 @@ pub(crate) fn run_library_scenarios(
         "collection filter",
     )?;
     let collection_total = collection_total.context("collection-filter query produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.filter.collection",
         true,
         collection_samples,
         usize_to_u64(fixture.collected.len(), "collection-filter expected count")?,
         i64_to_u64(collection_total, "collection-filter total")?,
+        &database_path,
     )?);
 
     let mut plays_total = None;
@@ -573,17 +612,437 @@ pub(crate) fn run_library_scenarios(
         },
     )?;
     let plays_total = plays_total.context("plays-sort query produced no total")?;
-    records.push(record(
+    records.push(record_with_database(
         "query.sort.plays",
         true,
         plays_samples,
         usize_to_u64(recovery_expected, "plays-sort expected total")?,
         i64_to_u64(plays_total, "plays-sort total")?,
+        &database_path,
     )?);
 
     database.checkpoint_wal()?;
     drop(database);
     Ok(records)
+}
+
+#[derive(Debug)]
+struct ActiveClaimOutcome {
+    before_claim: MediaQueueSnapshot,
+    after_claim: MediaQueueSnapshot,
+    claimed_path: String,
+    claimed_needs: MediaNeeds,
+    claimed_priority: MediaPriority,
+}
+
+pub(crate) fn run_playback_and_media_scenarios(
+    dataset: &GeneratedDataset,
+    run: &OwnedRunRoot,
+    policy: SamplePolicy,
+) -> Result<Vec<ScenarioRecord>> {
+    ensure!(
+        policy.heavy > 0 && policy.short > 0 && policy.scenario_timeout > Duration::ZERO,
+        "sample counts and scenario timeout must be positive"
+    );
+    validate_dataset_contract(dataset)?;
+    ensure!(
+        dataset.absolute_paths.len() >= MEDIA_PATH_COUNT,
+        "performance media dataset requires at least {MEDIA_PATH_COUNT} images"
+    );
+
+    let source_roots = canonical_source_roots(dataset)?;
+    let scanned = scan_all_sources(&source_roots)?;
+    validate_full_scan(dataset, &scanned)?;
+    let database_path = run.database_dir().join("playback-media.db");
+    let database = Database::new(&database_path).with_context(|| {
+        format!(
+            "open isolated playback database {}",
+            database_path.display()
+        )
+    })?;
+    register_sources(&database, &source_roots)?;
+    let expected_imported = scanned.iter().map(Vec::len).collect::<Vec<_>>();
+    let outcomes = reconcile_full_snapshot(&database, &source_roots, &scanned)?;
+    validate_reconciliation_outcomes(&outcomes, &expected_imported, "playback import")?;
+    let _fixture = prepare_query_fixture(&database, dataset)?;
+    validate_available_library(&database, &dataset.absolute_paths, &[])?;
+    database.checkpoint_wal()?;
+    drop(database);
+
+    let eligible = dataset
+        .absolute_paths
+        .iter()
+        .map(|path| path_text(path, "playback eligible path"))
+        .collect::<Result<HashSet<_>>>()?;
+    let total = usize_to_u64(eligible.len(), "playback eligible count")?;
+    let (database_bytes, wal_bytes) = database_sizes(&database_path)?;
+    let mut records = Vec::with_capacity(6);
+
+    let single_database_path = database_path.clone();
+    let single_eligible = eligible.clone();
+    let single_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let database = Database::new(&single_database_path).with_context(|| {
+            format!(
+                "open playback single database {}",
+                single_database_path.display()
+            )
+        })?;
+        let (samples, value) = measure_operation_validated(
+            policy.short,
+            |_| database.get_next_wallpaper(),
+            |_, path| validate_selected_path(path, &single_eligible),
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut single = record("playback.next.single", true, single_samples, 1, 1)?;
+    single.database_bytes = Some(database_bytes);
+    single.wal_bytes = wal_bytes;
+    records.push(single);
+
+    let multi_database_path = database_path.clone();
+    let multi_eligible = eligible;
+    let multi_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let database = Database::new(&multi_database_path).with_context(|| {
+            format!(
+                "open playback multi database {}",
+                multi_database_path.display()
+            )
+        })?;
+        let (samples, value) = measure_operation_validated(
+            policy.short,
+            |_| database.get_next_wallpapers(4),
+            |_, paths| validate_selected_paths(paths, 4, &multi_eligible),
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut multi = record("playback.next.multi", true, multi_samples, 4, 4)?;
+    multi.database_bytes = Some(database_bytes);
+    multi.wal_bytes = wal_bytes;
+    records.push(multi);
+
+    let media_paths = dataset
+        .absolute_paths
+        .iter()
+        .take(MEDIA_PATH_COUNT)
+        .map(|path| path_text(path, "performance media path"))
+        .collect::<Result<Vec<_>>>()?;
+    let cache_root = run.cache_dir();
+
+    let cold_paths = media_paths.clone();
+    let cold_roots = (0..policy.heavy)
+        .map(|index| cache_root.join(format!("thumbnail-cold-{index:04}")))
+        .collect::<Vec<_>>();
+    let cold_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let caches = cold_roots
+            .iter()
+            .map(|root| ThumbnailCache::new(root))
+            .collect::<Result<Vec<_>>>()?;
+        let (samples, value) = measure_operation_validated(
+            policy.heavy,
+            |sample_index| {
+                Ok(cold_paths
+                    .iter()
+                    .map(|path| {
+                        caches[sample_index].generate_derivatives(
+                            path,
+                            MediaNeeds {
+                                thumbnail: true,
+                                preview: false,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>())
+            },
+            |_, derivatives| validate_thumbnail_derivatives(derivatives, MEDIA_PATH_COUNT),
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut cold = record(
+        "media.thumbnail.cold",
+        true,
+        cold_samples,
+        MEDIA_PATH_COUNT as u64,
+        MEDIA_PATH_COUNT as u64,
+    )?;
+    cold.cache_state = CacheState::ColdDerivative;
+    cold.cache_hits = Some(0);
+    cold.cache_misses = Some(MEDIA_PATH_COUNT as u64);
+    cold.generated_derivatives = Some(MEDIA_PATH_COUNT as u64);
+    records.push(cold);
+
+    let warm_paths = media_paths.clone();
+    let warm_root = cache_root.join("thumbnail-warm");
+    let warm_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let cache = ThumbnailCache::new(&warm_root)?;
+        for path in &warm_paths {
+            let generated = cache.generate_derivatives(
+                path,
+                MediaNeeds {
+                    thumbnail: true,
+                    preview: false,
+                },
+            );
+            validate_nonempty_file(
+                generated.thumbnail.as_deref(),
+                "warm thumbnail precondition",
+            )?;
+        }
+        let (samples, value) = measure_operation_validated(
+            policy.short,
+            |_| {
+                Ok(warm_paths
+                    .iter()
+                    .map(|path| cache.cached_path(path))
+                    .collect::<Vec<_>>())
+            },
+            |_, hits| {
+                ensure!(
+                    hits.len() == MEDIA_PATH_COUNT,
+                    "warm thumbnail lookup count mismatch"
+                );
+                for hit in hits {
+                    validate_nonempty_file(hit.as_deref(), "warm thumbnail hit")?;
+                }
+                Ok(())
+            },
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut warm = record(
+        "media.thumbnail.warm",
+        true,
+        warm_samples,
+        MEDIA_PATH_COUNT as u64,
+        MEDIA_PATH_COUNT as u64,
+    )?;
+    warm.cache_state = CacheState::WarmDerivative;
+    warm.cache_hits = Some(MEDIA_PATH_COUNT as u64);
+    warm.cache_misses = Some(0);
+    warm.generated_derivatives = Some(0);
+    records.push(warm);
+
+    let active_path = media_paths
+        .first()
+        .cloned()
+        .context("performance media path set is empty")?;
+    let preview_path = active_path.clone();
+    let preview_roots = (0..policy.heavy)
+        .map(|index| cache_root.join(format!("preview-cold-{index:04}")))
+        .collect::<Vec<_>>();
+    let preview_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let caches = preview_roots
+            .iter()
+            .map(|root| ThumbnailCache::new(root))
+            .collect::<Result<Vec<_>>>()?;
+        let (samples, value) = measure_operation_validated(
+            policy.heavy,
+            |sample_index| {
+                Ok(caches[sample_index].generate_derivatives(
+                    &preview_path,
+                    MediaNeeds {
+                        thumbnail: true,
+                        preview: true,
+                    },
+                ))
+            },
+            |_, derivatives| {
+                validate_nonempty_file(derivatives.thumbnail.as_deref(), "cold preview thumbnail")?;
+                validate_nonempty_file(derivatives.preview.as_deref(), "cold preview output")
+            },
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut preview = record("media.preview.cold", true, preview_samples, 2, 2)?;
+    preview.cache_state = CacheState::ColdDerivative;
+    preview.cache_hits = Some(0);
+    preview.cache_misses = Some(2);
+    preview.generated_derivatives = Some(2);
+    records.push(preview);
+
+    let claim_active_path = active_path;
+    let claim_samples = run_with_deadline(policy.scenario_timeout, move || {
+        let queues = (0..policy.short)
+            .map(|_| MediaJobQueue::new())
+            .collect::<Vec<_>>();
+        let (samples, value) = measure_operation_validated(
+            policy.short,
+            |sample_index| {
+                let queue = &queues[sample_index];
+                for index in 0..ACTIVE_CLAIM_THUMBNAILS {
+                    ensure!(
+                        queue.enqueue(
+                            MediaJobKind::Thumbnail,
+                            format!("{claim_active_path}#performance-thumbnail-{index:04}"),
+                        ),
+                        "active-claim thumbnail enqueue was rejected"
+                    );
+                }
+                ensure!(
+                    queue.enqueue_active_preview(claim_active_path.clone()),
+                    "active preview enqueue was rejected"
+                );
+                let before_claim = queue.performance_snapshot();
+                let job = queue
+                    .try_pop_preview()
+                    .context("active preview was not claimable from reserved lane")?;
+                let after_claim = queue.performance_snapshot();
+                Ok(ActiveClaimOutcome {
+                    before_claim,
+                    after_claim,
+                    claimed_path: job.path,
+                    claimed_needs: job.needs,
+                    claimed_priority: job.priority,
+                })
+            },
+            |_, outcome| validate_active_claim(outcome, &claim_active_path),
+        )?;
+        drop(value);
+        Ok(samples)
+    })?;
+    let mut claim = record(
+        "media.preview.active-claim",
+        true,
+        claim_samples,
+        (ACTIVE_CLAIM_THUMBNAILS + 1) as u64,
+        (ACTIVE_CLAIM_THUMBNAILS + 1) as u64,
+    )?;
+    claim.queue_peak_pending = Some((ACTIVE_CLAIM_THUMBNAILS + 1) as u64);
+    records.push(claim);
+
+    ensure!(
+        records.iter().all(|record| {
+            record.timeout_count == 0
+                && record.status == RunStatus::Passed
+                && record.errors.is_empty()
+        }),
+        "playback/media scenario reported a failure"
+    );
+    ensure!(
+        total == dataset.manifest.item_count as u64,
+        "playback eligible set does not cover the CI dataset"
+    );
+    Ok(records)
+}
+
+fn validate_selected_path(path: &str, eligible: &HashSet<String>) -> Result<()> {
+    ensure!(
+        eligible.contains(path),
+        "playback selected an ineligible path"
+    );
+    ensure!(
+        Path::new(path).is_file(),
+        "playback selected a missing file"
+    );
+    Ok(())
+}
+
+fn validate_selected_paths(
+    paths: &[String],
+    expected_count: usize,
+    eligible: &HashSet<String>,
+) -> Result<()> {
+    ensure!(
+        paths.len() == expected_count,
+        "playback selected {} paths instead of {expected_count}",
+        paths.len()
+    );
+    let unique = paths.iter().collect::<HashSet<_>>();
+    ensure!(
+        unique.len() == expected_count,
+        "playback multi-selection repeated a path despite sufficient eligible files"
+    );
+    for path in paths {
+        validate_selected_path(path, eligible)?;
+    }
+    Ok(())
+}
+
+fn validate_thumbnail_derivatives(
+    derivatives: &[DerivativePaths],
+    expected_count: usize,
+) -> Result<()> {
+    ensure!(
+        derivatives.len() == expected_count,
+        "cold thumbnail derivative count mismatch"
+    );
+    for derivative in derivatives {
+        validate_nonempty_file(derivative.thumbnail.as_deref(), "cold thumbnail")?;
+        ensure!(
+            derivative.preview.is_none(),
+            "thumbnail-only generation unexpectedly produced a preview"
+        );
+    }
+    Ok(())
+}
+
+fn validate_nonempty_file(path: Option<&Path>, label: &str) -> Result<()> {
+    let path = path.with_context(|| format!("{label} path is missing"))?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("read {label} metadata at {}", path.display()))?;
+    ensure!(metadata.is_file(), "{label} output is not a regular file");
+    ensure!(metadata.len() > 0, "{label} output is empty");
+    Ok(())
+}
+
+fn validate_active_claim(outcome: &ActiveClaimOutcome, active_path: &str) -> Result<()> {
+    ensure!(
+        outcome.before_claim.pending_paths == ACTIVE_CLAIM_THUMBNAILS + 1,
+        "active-claim path backlog mismatch"
+    );
+    ensure!(
+        outcome.before_claim.running_paths == 0,
+        "active-claim queue unexpectedly had running work before claim"
+    );
+    ensure!(
+        outcome.before_claim.pending_thumbnails <= ACTIVE_CLAIM_THUMBNAILS,
+        "active-claim thumbnail backlog exceeded its production cap"
+    );
+    ensure!(
+        outcome.before_claim.pending_previews == 1,
+        "active preview was not pending before claim"
+    );
+    ensure!(
+        outcome.claimed_path == active_path,
+        "reserved preview lane claimed the wrong path"
+    );
+    ensure!(
+        outcome.claimed_needs.thumbnail && outcome.claimed_needs.preview,
+        "active preview claim did not merge both derivative needs"
+    );
+    ensure!(
+        outcome.claimed_priority == MediaPriority::ActivePreview,
+        "active preview claim lost its production priority"
+    );
+    ensure!(
+        outcome.after_claim.pending_paths == ACTIVE_CLAIM_THUMBNAILS
+            && outcome.after_claim.running_paths == 1
+            && outcome.after_claim.pending_previews == 0,
+        "active preview claim did not transition queue state correctly"
+    );
+    Ok(())
+}
+
+fn database_sizes(path: &Path) -> Result<(u64, Option<u64>)> {
+    let database_bytes = std::fs::metadata(path)
+        .with_context(|| format!("read performance database metadata {}", path.display()))?
+        .len();
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal_path = PathBuf::from(wal_name);
+    let wal_bytes = match std::fs::metadata(&wal_path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read performance WAL metadata {}", wal_path.display()))
+        }
+    };
+    Ok((database_bytes, wal_bytes))
 }
 
 fn validate_dataset_contract(dataset: &GeneratedDataset) -> Result<()> {
@@ -1357,7 +1816,7 @@ fn path_identity(path: &str) -> String {
 fn record(
     id: &str,
     critical: bool,
-    elapsed_micros: Vec<u64>,
+    samples: ScenarioSamples,
     expected_count: u64,
     actual_count: u64,
 ) -> Result<ScenarioRecord> {
@@ -1367,7 +1826,7 @@ fn record(
         selected_hotspot: false,
         cache_state: CacheState::NotApplicable,
         status: RunStatus::Passed,
-        samples: ScenarioSamples::from_elapsed_micros(elapsed_micros, 0)?,
+        samples,
         expected_count: Some(expected_count),
         actual_count: Some(actual_count),
         database_bytes: None,
@@ -1379,6 +1838,21 @@ fn record(
         timeout_count: 0,
         errors: Vec::new(),
     })
+}
+
+fn record_with_database(
+    id: &str,
+    critical: bool,
+    samples: ScenarioSamples,
+    expected_count: u64,
+    actual_count: u64,
+    database_path: &Path,
+) -> Result<ScenarioRecord> {
+    let mut record = record(id, critical, samples, expected_count, actual_count)?;
+    let (database_bytes, wal_bytes) = database_sizes(database_path)?;
+    record.database_bytes = Some(database_bytes);
+    record.wal_bytes = wal_bytes;
+    Ok(record)
 }
 
 fn usize_to_u64(value: usize, label: &str) -> Result<u64> {
@@ -1408,6 +1882,40 @@ mod tests {
     use crate::performance_harness::dataset::{generate_dataset, DatasetScale, DATASET_SEED};
     use crate::performance_harness::owned_temp::OwnedRunRoot;
     use crate::performance_harness::protocol::RunStatus;
+
+    #[test]
+    fn ci_playback_and_media_scenarios_are_safe_and_bounded() {
+        let run = OwnedRunRoot::create_for_test("playback-media").unwrap();
+        let dataset = generate_dataset(&run, DatasetScale::Ci, DATASET_SEED).unwrap();
+        let records =
+            super::run_playback_and_media_scenarios(&dataset, &run, SamplePolicy::ci()).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "playback.next.single",
+                "playback.next.multi",
+                "media.thumbnail.cold",
+                "media.thumbnail.warm",
+                "media.preview.cold",
+                "media.preview.active-claim",
+            ]
+        );
+        assert!(records
+            .iter()
+            .all(|record| record.status == RunStatus::Passed));
+        assert!(records.iter().all(|record| record.errors.is_empty()));
+        assert!(records
+            .iter()
+            .filter_map(|record| record.queue_peak_pending)
+            .all(|peak| peak <= 257));
+        assert!(records
+            .iter()
+            .all(|record| record.samples.peak_working_set_bytes > 0));
+        run.cleanup().unwrap();
+    }
 
     #[test]
     fn ci_library_scenarios_use_production_paths_and_preserve_counts() {
@@ -1486,11 +1994,18 @@ mod tests {
         }
         assert!(records.iter().all(|record| record.critical));
         assert!(records.iter().all(|record| record.errors.is_empty()));
+        assert!(records
+            .iter()
+            .all(|record| record.samples.peak_working_set_bytes > 0));
+        assert!(records
+            .iter()
+            .filter(|record| record.id != "scan.full")
+            .all(|record| record.database_bytes.is_some_and(|bytes| bytes > 0)));
         run.cleanup().unwrap();
     }
 
     #[test]
-    fn sample_policy_and_temporary_timer_keep_the_declared_sample_contract() {
+    fn sample_policy_and_working_set_metrics_keep_the_declared_sample_contract() {
         let ci = SamplePolicy::ci();
         assert_eq!(ci.heavy, 1);
         assert_eq!(ci.short, 3);
@@ -1508,7 +2023,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(samples.len(), 3);
+        assert_eq!(samples.elapsed_micros.len(), 3);
         assert_eq!(consumed.get(), 3);
         assert!(measure_each_sample::<()>(0, |_| Ok(()), |_, _| Ok(())).is_err());
     }

@@ -4,6 +4,15 @@ use std::sync::{Arc, Condvar, Mutex};
 const MAX_QUEUED_THUMBNAILS: usize = 256;
 const MAX_QUEUED_SPECULATIVE_PREVIEWS: usize = 2;
 
+#[cfg(feature = "performance-harness")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaQueueSnapshot {
+    pub pending_paths: usize,
+    pub running_paths: usize,
+    pub pending_thumbnails: usize,
+    pub pending_previews: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum MediaJobKind {
     Thumbnail,
@@ -315,6 +324,32 @@ impl MediaJobQueue {
         self.inner.condvar.notify_all();
     }
 
+    #[cfg(feature = "performance-harness")]
+    pub(crate) fn performance_snapshot(&self) -> MediaQueueSnapshot {
+        let state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        MediaQueueSnapshot {
+            pending_paths: state
+                .jobs
+                .values()
+                .filter(|job| !job.queued.is_empty())
+                .count(),
+            running_paths: state
+                .jobs
+                .values()
+                .filter(|job| job.is_running && !job.running.is_empty())
+                .count(),
+            pending_thumbnails: state.thumbnails.len(),
+            pending_previews: state.previews.len() + state.speculative_previews.len(),
+        }
+    }
+
+    #[cfg(feature = "performance-harness")]
+    pub(crate) fn performance_config_descriptor() -> String {
+        format!(
+            "media-queue:max-thumbnails={MAX_QUEUED_THUMBNAILS};max-speculative-previews={MAX_QUEUED_SPECULATIVE_PREVIEWS}"
+        )
+    }
+
     fn pop_preview_job(state: &mut QueueState) -> Option<MediaJob> {
         while let Some(path) = state.previews.pop_front() {
             if let Some(job) = Self::claim_path(state, path) {
@@ -464,5 +499,25 @@ mod tests {
         assert_eq!(active.path, "active");
         assert_eq!(active.priority, MediaPriority::ActivePreview);
         assert!(queue.try_pop().is_none());
+    }
+
+    #[cfg(feature = "performance-harness")]
+    #[test]
+    fn performance_snapshot_counts_pending_and_running_needs() {
+        let queue = MediaJobQueue::new();
+        assert!(queue.enqueue(MediaJobKind::Thumbnail, "thumb-a".to_string()));
+        assert!(queue.enqueue(MediaJobKind::Thumbnail, "thumb-b".to_string()));
+        assert!(queue.enqueue_active_preview("active".to_string()));
+
+        let preview = queue
+            .try_pop_preview()
+            .expect("active preview should be claimable");
+        let snapshot = queue.performance_snapshot();
+
+        assert_eq!(snapshot.pending_paths, 2);
+        assert_eq!(snapshot.running_paths, 1);
+        assert_eq!(snapshot.pending_thumbnails, 2);
+        assert_eq!(snapshot.pending_previews, 0);
+        queue.finish(&preview);
     }
 }
