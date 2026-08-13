@@ -1,5 +1,8 @@
 // In release builds, hide the console window (prevents flash when invoked from right-click menu)
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), not(feature = "performance-harness")),
+    windows_subsystem = "windows"
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,6 +42,8 @@ mod media_queue_lane_tests;
 #[cfg(test)]
 mod media_queue_upgrade_tests;
 mod paths;
+#[cfg(feature = "performance-harness")]
+mod performance_harness;
 mod playback_action;
 #[cfg(test)]
 mod playback_entrypoint_tests;
@@ -1987,6 +1992,14 @@ fn is_autostart_enabled() -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "performance-harness")]
+    if let Some(result) = performance_harness::run_if_requested(&args) {
+        if let Err(error) = result {
+            eprintln!("PureWall performance harness failed: {error:#}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let initial_cli_action = cli_action_from_args(&args);
 
     tauri::Builder::default()

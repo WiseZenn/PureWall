@@ -3,6 +3,10 @@ name = "purewall"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+performance-harness = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
