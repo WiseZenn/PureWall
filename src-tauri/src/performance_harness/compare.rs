@@ -49,20 +49,20 @@ pub(crate) fn compare_reports(
     baseline: &BenchmarkReport,
     candidate: &BenchmarkReport,
 ) -> ComparisonReport {
-    let failed_reasons = run_failure_reasons("baseline", baseline)
-        .into_iter()
-        .chain(run_failure_reasons("candidate", candidate))
-        .collect::<Vec<_>>();
-    if !failed_reasons.is_empty() {
-        return comparison_error(baseline, candidate, Verdict::Failed, failed_reasons);
-    }
-
     let invalid_reasons = report_validation_errors("baseline", baseline)
         .into_iter()
         .chain(report_validation_errors("candidate", candidate))
         .collect::<Vec<_>>();
     if !invalid_reasons.is_empty() {
         return comparison_error(baseline, candidate, Verdict::Failed, invalid_reasons);
+    }
+
+    let failed_reasons = run_failure_reasons("baseline", baseline)
+        .into_iter()
+        .chain(run_failure_reasons("candidate", candidate))
+        .collect::<Vec<_>>();
+    if !failed_reasons.is_empty() {
+        return comparison_error(baseline, candidate, Verdict::Failed, failed_reasons);
     }
 
     let mut incompatible = Vec::new();
@@ -199,24 +199,11 @@ pub(crate) fn compare_reports(
         comparisons.push(compare_scenario(baseline_scenario, candidate_scenario));
     }
 
-    let overall = if comparisons
+    let overall = comparisons
         .iter()
-        .any(|comparison| comparison.verdict == Verdict::NotComparable)
-    {
-        Verdict::NotComparable
-    } else if comparisons
-        .iter()
-        .any(|comparison| comparison.verdict == Verdict::Regressed)
-    {
-        Verdict::Regressed
-    } else if comparisons
-        .iter()
-        .any(|comparison| comparison.verdict == Verdict::Improved)
-    {
-        Verdict::Improved
-    } else {
-        Verdict::Stable
-    };
+        .map(|comparison| comparison.verdict)
+        .max_by_key(|verdict| verdict_severity(*verdict))
+        .expect("validated reports contain at least one scenario");
 
     ComparisonReport {
         schema_version: REPORT_SCHEMA_VERSION,
@@ -225,6 +212,16 @@ pub(crate) fn compare_reports(
         overall,
         scenarios: comparisons,
         errors: Vec::new(),
+    }
+}
+
+fn verdict_severity(verdict: Verdict) -> u8 {
+    match verdict {
+        Verdict::Improved => 0,
+        Verdict::Stable => 1,
+        Verdict::Regressed => 2,
+        Verdict::NotComparable => 3,
+        Verdict::Failed => 4,
     }
 }
 
@@ -347,6 +344,17 @@ fn run_failure_reasons(label: &str, report: &BenchmarkReport) -> Vec<String> {
 
 fn report_validation_errors(label: &str, report: &BenchmarkReport) -> Vec<String> {
     let mut errors = Vec::new();
+    if report.run_status == RunStatus::Failed
+        && report.errors.is_empty()
+        && report
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.errors.is_empty())
+    {
+        errors.push(format!(
+            "{label} failed report must include report-level or scenario-level errors"
+        ));
+    }
     if report.git_commit.len() != 40
         || !report
             .git_commit
@@ -579,6 +587,31 @@ mod tests {
     }
 
     #[test]
+    fn mixed_improved_and_stable_scenarios_aggregate_to_stable() {
+        let mut baseline = protocol_test_report("same", 100, 100, 1_000);
+        let mut stable = baseline.scenarios[0].clone();
+        stable.id = "query.page.last".into();
+        baseline.scenarios.push(stable);
+
+        let mut candidate = baseline.clone();
+        candidate.scenarios[0].selected_hotspot = true;
+        candidate.scenarios[0].samples.median_micros = 80;
+        candidate.scenarios[0].samples.p95_micros = 80;
+        candidate.scenarios[0].samples.elapsed_micros = vec![80, 80];
+
+        let comparison = compare_reports(&baseline, &candidate);
+        assert_eq!(
+            comparison
+                .scenarios
+                .iter()
+                .map(|scenario| scenario.verdict)
+                .collect::<Vec<_>>(),
+            vec![Verdict::Improved, Verdict::Stable]
+        );
+        assert_eq!(comparison.overall, Verdict::Stable);
+    }
+
+    #[test]
     fn missing_scenarios_are_not_comparable_and_unknown_hotspots_fail() {
         let mut baseline = protocol_test_report("same", 100, 100, 1_000);
         let mut second = baseline.scenarios[0].clone();
@@ -646,6 +679,28 @@ mod tests {
             compare_reports(&baseline, &timeout).overall,
             Verdict::Failed
         );
+    }
+
+    #[test]
+    fn failed_report_requires_report_or_scenario_diagnostic_evidence() {
+        let baseline = protocol_test_report("same", 100, 100, 1_000);
+        let mut candidate = protocol_test_report("same", 50, 50, 500);
+        candidate.run_status = RunStatus::Failed;
+
+        let missing_diagnostic = compare_reports(&baseline, &candidate);
+        assert_eq!(missing_diagnostic.overall, Verdict::Failed);
+        assert!(missing_diagnostic.errors.iter().any(|error| {
+            error == "candidate failed report must include report-level or scenario-level errors"
+        }));
+
+        candidate.scenarios[0]
+            .errors
+            .push("record count mismatch".into());
+        let scenario_diagnostic = compare_reports(&baseline, &candidate);
+        assert_eq!(scenario_diagnostic.overall, Verdict::Failed);
+        assert!(!scenario_diagnostic.errors.iter().any(|error| {
+            error == "candidate failed report must include report-level or scenario-level errors"
+        }));
     }
 
     #[test]
