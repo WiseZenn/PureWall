@@ -53,3 +53,21 @@ src-tauri/tauri.release.generated.conf.json
 
 # pi-subagents runtime state
 .pi-subagents/
+/.pi/
+/NUL
+
+# Local project memory and agent workflows (internal, kept local)
+/AGENTS.md
+/prompt/
+/docs/project-docs/
+/docs/superpowers/
+/.superpowers/
+/PureWall - 桌面壁纸美学管家 开发计划.md
+
+# Raw/internal design candidates
+/design/ChatGPT Image*.png
+/design/ig_*.png
+/design/已生成图像*.png
+/design/PureWall-Living-Gallery-Fusion.*
+/design/purewall-icon-motion-spec.md
+/design/purewall-icon-motion.html
