@@ -6,6 +6,8 @@ mod dataset;
 mod owned_temp;
 #[cfg_attr(not(test), allow(dead_code))]
 mod protocol;
+#[cfg_attr(not(test), allow(dead_code))]
+mod scenarios;
 
 pub(crate) fn run_if_requested(args: &[String]) -> Option<anyhow::Result<()>> {
     let marker = args.iter().position(|arg| arg == "--performance-harness")?;
