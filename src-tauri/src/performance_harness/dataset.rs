@@ -92,6 +92,51 @@ pub(crate) struct MutationSet {
     pub(crate) removals: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationPathKind {
+    Missing,
+    File,
+    Directory,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MutationPathInspection {
+    kind: MutationPathKind,
+    is_symlink: bool,
+    is_reparse_point: bool,
+}
+
+impl MutationPathInspection {
+    fn is_link_or_reparse(self) -> bool {
+        self.is_symlink || self.is_reparse_point
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationOperation {
+    Addition,
+    Removal,
+    Recovery,
+}
+
+impl MutationOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Addition => "performance dataset mutation addition",
+            Self::Removal => "performance dataset mutation removal",
+            Self::Recovery => "performance dataset recovery",
+        }
+    }
+
+    fn expected_target_kind(self) -> MutationPathKind {
+        match self {
+            Self::Addition | Self::Recovery => MutationPathKind::Missing,
+            Self::Removal => MutationPathKind::File,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GeneratedDataset {
     pub(crate) manifest: DatasetManifest,
@@ -129,33 +174,75 @@ impl GeneratedDataset {
     }
 
     pub(crate) fn apply_incremental_mutations(&self) -> Result<MutationSet> {
-        self.validate_mutation_paths(&self.mutations.additions)?;
-        self.validate_mutation_paths(&self.mutations.removals)?;
+        let mut inspect = inspect_mutation_path_no_follow;
+        let mut canonicalize = |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+        let mut link = |source: &Path, target: &Path| fs::hard_link(source, target);
+        let mut remove = |target: &Path| fs::remove_file(target);
+        self.apply_incremental_mutations_with(
+            &mut inspect,
+            &mut canonicalize,
+            &mut link,
+            &mut remove,
+        )
+    }
 
+    pub(crate) fn recover_removed(&self) -> Result<Vec<PathBuf>> {
+        let mut inspect = inspect_mutation_path_no_follow;
+        let mut canonicalize = |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+        let mut link = |source: &Path, target: &Path| fs::hard_link(source, target);
+        self.recover_removed_with(&mut inspect, &mut canonicalize, &mut link)
+    }
+
+    fn apply_incremental_mutations_with<I, C, H, R>(
+        &self,
+        inspect: &mut I,
+        canonicalize: &mut C,
+        link: &mut H,
+        remove: &mut R,
+    ) -> Result<MutationSet>
+    where
+        I: FnMut(&Path) -> Result<MutationPathInspection>,
+        C: FnMut(&Path) -> Result<PathBuf>,
+        H: FnMut(&Path, &Path) -> std::io::Result<()>,
+        R: FnMut(&Path) -> std::io::Result<()>,
+    {
         for path in &self.mutations.additions {
-            if path.exists() {
-                bail!("performance dataset mutation addition already exists");
-            }
-            let backing = self
-                .backing_lookup
-                .get(path)
-                .ok_or_else(|| anyhow!("performance dataset mutation backing lookup is missing"))?;
-            if !backing.is_file() || !backing.starts_with(&self.backing_dir) {
-                bail!("performance dataset mutation backing path is invalid");
-            }
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::Addition,
+                inspect,
+                canonicalize,
+            )?;
+            self.validate_mutation_backing_with(path, MutationOperation::Addition, inspect)?;
         }
         for path in &self.mutations.removals {
-            if !path.is_file() {
-                bail!("performance dataset mutation removal is missing");
-            }
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::Removal,
+                inspect,
+                canonicalize,
+            )?;
         }
 
         for path in &self.mutations.additions {
-            let backing = self.backing_lookup.get(path).expect("validated lookup");
-            hard_link(backing, path)?;
+            let backing =
+                self.validate_mutation_backing_with(path, MutationOperation::Addition, inspect)?;
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::Addition,
+                inspect,
+                canonicalize,
+            )?;
+            hard_link_with(backing, path, |source, target| link(source, target))?;
         }
         for path in &self.mutations.removals {
-            fs::remove_file(path).with_context(|| {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::Removal,
+                inspect,
+                canonicalize,
+            )?;
+            remove(path).with_context(|| {
                 format!(
                     "performance dataset mutation failed to remove {}",
                     path.display()
@@ -165,27 +252,199 @@ impl GeneratedDataset {
         Ok(self.mutations.clone())
     }
 
-    pub(crate) fn recover_removed(&self) -> Result<Vec<PathBuf>> {
-        self.validate_mutation_paths(&self.mutations.removals)?;
+    fn recover_removed_with<I, C, H>(
+        &self,
+        inspect: &mut I,
+        canonicalize: &mut C,
+        link: &mut H,
+    ) -> Result<Vec<PathBuf>>
+    where
+        I: FnMut(&Path) -> Result<MutationPathInspection>,
+        C: FnMut(&Path) -> Result<PathBuf>,
+        H: FnMut(&Path, &Path) -> std::io::Result<()>,
+    {
         for path in &self.mutations.removals {
-            if path.exists() {
-                bail!("performance dataset recovery target already exists");
-            }
-            let backing = self
-                .backing_lookup
-                .get(path)
-                .ok_or_else(|| anyhow!("performance dataset recovery backing lookup is missing"))?;
-            if !backing.is_file() || !backing.starts_with(&self.backing_dir) {
-                bail!("performance dataset recovery backing path is invalid");
-            }
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::Recovery,
+                inspect,
+                canonicalize,
+            )?;
+            self.validate_mutation_backing_with(path, MutationOperation::Recovery, inspect)?;
         }
         for path in &self.mutations.removals {
-            hard_link(
-                self.backing_lookup.get(path).expect("validated lookup"),
+            let backing =
+                self.validate_mutation_backing_with(path, MutationOperation::Recovery, inspect)?;
+            self.validate_mutation_target_with(
                 path,
+                MutationOperation::Recovery,
+                inspect,
+                canonicalize,
             )?;
+            hard_link_with(backing, path, |source, target| link(source, target))?;
         }
         Ok(self.mutations.removals.clone())
+    }
+
+    fn validate_mutation_backing_with<'a, I>(
+        &'a self,
+        target: &Path,
+        operation: MutationOperation,
+        inspect: &mut I,
+    ) -> Result<&'a Path>
+    where
+        I: FnMut(&Path) -> Result<MutationPathInspection>,
+    {
+        let backing = self.backing_lookup.get(target).ok_or_else(|| {
+            anyhow!(
+                "{} backing lookup is missing for {}",
+                operation.label(),
+                target.display()
+            )
+        })?;
+        if !is_strict_descendant(backing, &self.backing_dir) || has_path_alias(backing) {
+            bail!(
+                "{} backing path is outside the owned backing directory: {}",
+                operation.label(),
+                backing.display()
+            );
+        }
+        let inspected = inspect(backing).with_context(|| {
+            format!(
+                "{} failed no-follow backing inspection for {}",
+                operation.label(),
+                backing.display()
+            )
+        })?;
+        if inspected.is_link_or_reparse() || inspected.kind != MutationPathKind::File {
+            bail!(
+                "{} backing path is not a safe regular file: {}",
+                operation.label(),
+                backing.display()
+            );
+        }
+        Ok(backing)
+    }
+
+    fn validate_mutation_target_with<I, C>(
+        &self,
+        target: &Path,
+        operation: MutationOperation,
+        inspect: &mut I,
+        canonicalize: &mut C,
+    ) -> Result<()>
+    where
+        I: FnMut(&Path) -> Result<MutationPathInspection>,
+        C: FnMut(&Path) -> Result<PathBuf>,
+    {
+        let source_root = self
+            .source_roots
+            .iter()
+            .find(|root| is_strict_descendant(target, root))
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} refused invalid lexical target outside registered source roots: {}",
+                    operation.label(),
+                    target.display()
+                )
+            })?;
+        validate_lexical_mutation_target(source_root, target, operation)?;
+        let target_parent = target.parent().ok_or_else(|| {
+            anyhow!(
+                "{} refused target without parent: {}",
+                operation.label(),
+                target.display()
+            )
+        })?;
+
+        inspect_mutation_directory(
+            source_root,
+            source_root,
+            operation,
+            MutationDirectoryRole::SourceRoot,
+            inspect,
+        )?;
+        let relative_parent = target_parent.strip_prefix(source_root).map_err(|_| {
+            anyhow!(
+                "{} refused incompatible lexical target parent: {}",
+                operation.label(),
+                target_parent.display()
+            )
+        })?;
+        let mut current = source_root.to_path_buf();
+        for component in relative_parent.components() {
+            let Component::Normal(name) = component else {
+                bail!(
+                    "{} refused aliased lexical target parent: {}",
+                    operation.label(),
+                    target_parent.display()
+                );
+            };
+            current.push(name);
+            inspect_mutation_directory(
+                &current,
+                source_root,
+                operation,
+                MutationDirectoryRole::TargetAncestor,
+                inspect,
+            )?;
+        }
+
+        let canonical_root = canonicalize(source_root).with_context(|| {
+            format!(
+                "{} failed to canonicalize source root {}",
+                operation.label(),
+                source_root.display()
+            )
+        })?;
+        let canonical_parent = canonicalize(target_parent).with_context(|| {
+            format!(
+                "{} failed to canonicalize target parent {}",
+                operation.label(),
+                target_parent.display()
+            )
+        })?;
+        if !is_same_or_descendant(&canonical_parent, &canonical_root) {
+            bail!(
+                "{} refused physical target parent outside source root: {} (source root {})",
+                operation.label(),
+                target_parent.display(),
+                source_root.display()
+            );
+        }
+
+        validate_lexical_mutation_target(source_root, target, operation)?;
+        let inspected_target = inspect(target).with_context(|| {
+            format!(
+                "{} failed no-follow target inspection for {}",
+                operation.label(),
+                target.display()
+            )
+        })?;
+        if inspected_target.is_link_or_reparse() {
+            bail!(
+                "{} refused unsafe target (symlink/reparse): {}",
+                operation.label(),
+                target.display()
+            );
+        }
+        if inspected_target.kind != operation.expected_target_kind() {
+            match operation {
+                MutationOperation::Addition => bail!(
+                    "performance dataset mutation addition already exists: {}",
+                    target.display()
+                ),
+                MutationOperation::Removal => bail!(
+                    "performance dataset mutation removal is not a regular file: {}",
+                    target.display()
+                ),
+                MutationOperation::Recovery => bail!(
+                    "performance dataset recovery target already exists: {}",
+                    target.display()
+                ),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -831,6 +1090,175 @@ fn verify_generated_dataset(dataset: &GeneratedDataset) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationDirectoryRole {
+    SourceRoot,
+    TargetAncestor,
+}
+
+fn inspect_mutation_path_no_follow(path: &Path) -> Result<MutationPathInspection> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MutationPathInspection {
+                kind: MutationPathKind::Missing,
+                is_symlink: false,
+                is_reparse_point: false,
+            });
+        }
+        Err(error) => {
+            return Err(anyhow!(
+                "performance dataset mutation no-follow inspection failed for {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let kind = if metadata.is_file() {
+        MutationPathKind::File
+    } else if metadata.is_dir() {
+        MutationPathKind::Directory
+    } else {
+        MutationPathKind::Other
+    };
+    Ok(MutationPathInspection {
+        kind,
+        is_symlink: metadata.file_type().is_symlink(),
+        is_reparse_point: metadata_is_reparse_point(&metadata),
+    })
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+fn inspect_mutation_directory<I>(
+    path: &Path,
+    source_root: &Path,
+    operation: MutationOperation,
+    role: MutationDirectoryRole,
+    inspect: &mut I,
+) -> Result<()>
+where
+    I: FnMut(&Path) -> Result<MutationPathInspection>,
+{
+    let inspected = inspect(path).with_context(|| {
+        format!(
+            "{} failed no-follow directory inspection for {}",
+            operation.label(),
+            path.display()
+        )
+    })?;
+    if inspected.is_link_or_reparse() {
+        match role {
+            MutationDirectoryRole::SourceRoot => bail!(
+                "{} refused unsafe source root (symlink/reparse): {}",
+                operation.label(),
+                path.display()
+            ),
+            MutationDirectoryRole::TargetAncestor => bail!(
+                "{} refused unsafe target ancestor (symlink/reparse): {} (source root {})",
+                operation.label(),
+                path.display(),
+                source_root.display()
+            ),
+        }
+    }
+    if inspected.kind != MutationPathKind::Directory {
+        match role {
+            MutationDirectoryRole::SourceRoot => bail!(
+                "{} refused source root that is not an existing directory: {}",
+                operation.label(),
+                path.display()
+            ),
+            MutationDirectoryRole::TargetAncestor => bail!(
+                "{} refused target ancestor that is not an existing directory: {} (source root {})",
+                operation.label(),
+                path.display(),
+                source_root.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn validate_lexical_mutation_target(
+    source_root: &Path,
+    target: &Path,
+    operation: MutationOperation,
+) -> Result<()> {
+    if !source_root.is_absolute()
+        || has_path_alias(source_root)
+        || !target.is_absolute()
+        || has_path_alias(target)
+        || !is_strict_descendant(target, source_root)
+    {
+        bail!(
+            "{} refused invalid lexical target: {}",
+            operation.label(),
+            target.display()
+        );
+    }
+    let parent = target.parent().ok_or_else(|| {
+        anyhow!(
+            "{} refused target without parent: {}",
+            operation.label(),
+            target.display()
+        )
+    })?;
+    let name = target.file_name().ok_or_else(|| {
+        anyhow!(
+            "{} refused target without file name: {}",
+            operation.label(),
+            target.display()
+        )
+    })?;
+    let mut name_components = Path::new(name).components();
+    if !matches!(name_components.next(), Some(Component::Normal(_)))
+        || name_components.next().is_some()
+    {
+        bail!(
+            "{} refused invalid target file name: {}",
+            operation.label(),
+            target.display()
+        );
+    }
+    let relative_parent = parent.strip_prefix(source_root).map_err(|_| {
+        anyhow!(
+            "{} refused incompatible lexical target parent: {}",
+            operation.label(),
+            parent.display()
+        )
+    })?;
+    if relative_parent
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!(
+            "{} refused aliased lexical target parent: {}",
+            operation.label(),
+            parent.display()
+        );
+    }
+    let reconstructed = source_root.join(relative_parent).join(name);
+    if path_identity(&reconstructed) != path_identity(target) {
+        bail!(
+            "{} refused target name reconstruction mismatch: {}",
+            operation.label(),
+            target.display()
+        );
+    }
+    Ok(())
+}
+
 fn has_path_alias(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
@@ -871,10 +1299,15 @@ fn is_strict_descendant(path: &Path, root: &Path) -> bool {
     path != root && path.starts_with(&format!("{root}/"))
 }
 
+fn is_same_or_descendant(path: &Path, root: &Path) -> bool {
+    path_identity(path) == path_identity(root) || is_strict_descendant(path, root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::performance_harness::owned_temp::OwnedRunRoot;
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -1153,6 +1586,216 @@ mod tests {
             let recovered = dataset.recover_removed().unwrap();
             assert_eq!(recovered, expected.removals);
             assert!(recovered.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn mutation_addition_refuses_injected_source_root_symlink_before_any_change() {
+        with_owned_run("dataset-mutation-root-link", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            let addition = &dataset.mutations.additions[0];
+            let source_root = dataset
+                .source_roots
+                .iter()
+                .find(|root| is_strict_descendant(addition, root))
+                .unwrap()
+                .clone();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| {
+                if path == source_root {
+                    Ok(MutationPathInspection {
+                        kind: MutationPathKind::Other,
+                        is_symlink: true,
+                        is_reparse_point: cfg!(windows),
+                    })
+                } else {
+                    inspect_mutation_path_no_follow(path)
+                }
+            };
+            let mut canonicalize =
+                |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+            let mut link = |source: &Path, target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::hard_link(source, target)
+            };
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .apply_incremental_mutations_with(
+                    &mut inspect,
+                    &mut canonicalize,
+                    &mut link,
+                    &mut remove,
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset mutation addition refused unsafe source root (symlink/reparse): "
+            ));
+            assert!(error.contains(&source_root.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(dataset
+                .mutations
+                .additions
+                .iter()
+                .all(|path| !path.exists()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn mutation_removal_refuses_injected_nested_reparse_before_any_change() {
+        with_owned_run("dataset-mutation-ancestor-link", |run| {
+            let mut dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            let (removal, source_root) = dataset
+                .mutations
+                .removals
+                .iter()
+                .find_map(|path| {
+                    let root = dataset
+                        .source_roots
+                        .iter()
+                        .find(|root| is_strict_descendant(path, root))?;
+                    (path.parent()? != root.as_path()).then_some((path, root))
+                })
+                .unwrap();
+            let unsafe_parent = removal.parent().unwrap().to_path_buf();
+            let source_root = source_root.clone();
+            let unchanged_additions = dataset.mutations.additions.clone();
+            dataset.mutations.additions.clear();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| {
+                if path == unsafe_parent {
+                    Ok(MutationPathInspection {
+                        kind: MutationPathKind::Directory,
+                        is_symlink: false,
+                        is_reparse_point: true,
+                    })
+                } else {
+                    inspect_mutation_path_no_follow(path)
+                }
+            };
+            let mut canonicalize =
+                |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+            let mut link = |source: &Path, target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::hard_link(source, target)
+            };
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .apply_incremental_mutations_with(
+                    &mut inspect,
+                    &mut canonicalize,
+                    &mut link,
+                    &mut remove,
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset mutation removal refused unsafe target ancestor (symlink/reparse): "
+            ));
+            assert!(error.contains(&unsafe_parent.display().to_string()));
+            assert!(error.contains(&source_root.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(unchanged_additions.iter().all(|path| !path.exists()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn mutation_addition_refuses_canonical_parent_escape_before_any_change() {
+        with_owned_run("dataset-mutation-physical-escape", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            let addition = &dataset.mutations.additions[0];
+            let target_parent = addition.parent().unwrap().to_path_buf();
+            let escaped_parent = fs::canonicalize(&dataset.backing_dir).unwrap();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| inspect_mutation_path_no_follow(path);
+            let mut canonicalize = |path: &Path| {
+                if path == target_parent {
+                    Ok(escaped_parent.clone())
+                } else {
+                    fs::canonicalize(path).map_err(anyhow::Error::from)
+                }
+            };
+            let mut link = |source: &Path, target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::hard_link(source, target)
+            };
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .apply_incremental_mutations_with(
+                    &mut inspect,
+                    &mut canonicalize,
+                    &mut link,
+                    &mut remove,
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset mutation addition refused physical target parent outside source root: "
+            ));
+            assert!(error.contains(&target_parent.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(dataset
+                .mutations
+                .additions
+                .iter()
+                .all(|path| !path.exists()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn recovery_refuses_injected_target_reparse_before_any_change() {
+        with_owned_run("dataset-recovery-target-link", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            dataset.apply_incremental_mutations().unwrap();
+            let unsafe_target = dataset.mutations.removals[0].clone();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| {
+                if path == unsafe_target {
+                    Ok(MutationPathInspection {
+                        kind: MutationPathKind::File,
+                        is_symlink: false,
+                        is_reparse_point: true,
+                    })
+                } else {
+                    inspect_mutation_path_no_follow(path)
+                }
+            };
+            let mut canonicalize =
+                |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+            let mut link = |source: &Path, target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::hard_link(source, target)
+            };
+
+            let error = dataset
+                .recover_removed_with(&mut inspect, &mut canonicalize, &mut link)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset recovery refused unsafe target (symlink/reparse): "
+            ));
+            assert!(error.contains(&unsafe_target.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(dataset.mutations.removals.iter().all(|path| !path.exists()));
         });
     }
 
