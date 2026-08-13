@@ -1,6 +1,8 @@
 #[cfg_attr(not(test), allow(dead_code))]
 mod compare;
 #[cfg_attr(not(test), allow(dead_code))]
+mod owned_temp;
+#[cfg_attr(not(test), allow(dead_code))]
 mod protocol;
 
 pub(crate) fn run_if_requested(args: &[String]) -> Option<anyhow::Result<()>> {
