@@ -43,24 +43,21 @@ impl SamplePolicy {
     }
 }
 
-fn measure_elapsed<T>(
+fn measure_each_sample<T>(
     count: usize,
     mut operation: impl FnMut(usize) -> Result<T>,
-) -> Result<(Vec<u64>, T)> {
+    mut consume: impl FnMut(usize, &T) -> Result<()>,
+) -> Result<Vec<u64>> {
     ensure!(count > 0, "sample count must be positive");
     let mut samples = Vec::with_capacity(count);
-    let mut last = None;
     for sample_index in 0..count {
-        drop(last.take());
         let started = std::time::Instant::now();
         let value = operation(sample_index)?;
         samples.push(started.elapsed().as_micros().try_into().unwrap_or(u64::MAX));
-        last = Some(value);
+        consume(sample_index, &value)?;
+        drop(value);
     }
-    Ok((
-        samples,
-        last.expect("positive sample count must produce a value"),
-    ))
+    Ok(samples)
 }
 
 struct LibrarySample {
@@ -77,6 +74,7 @@ struct QueryFixture {
     collected: HashSet<String>,
     liked: HashSet<String>,
     unicode_matches: HashSet<String>,
+    played: Vec<(String, i32)>,
 }
 
 struct IncrementalRoot {
@@ -92,7 +90,7 @@ struct StartupSnapshot {
 }
 
 struct StartupMeasurement {
-    database: Database,
+    _database: Database,
     snapshot: StartupSnapshot,
 }
 
@@ -112,10 +110,20 @@ pub(crate) fn run_library_scenarios(
     let mut records = Vec::with_capacity(13);
     let source_roots = canonical_source_roots(dataset)?;
 
-    let (scan_samples, scanned_by_root) =
-        measure_elapsed(policy.heavy, |_| scan_all_sources(&source_roots))?;
-    let scanned_count = image_count(&scanned_by_root);
-    validate_full_scan(dataset, &scanned_by_root)?;
+    let mut scanned_count = None;
+    let scan_samples = measure_each_sample(
+        policy.heavy,
+        |_| scan_all_sources(&source_roots),
+        |_, images| {
+            validate_full_scan(dataset, images)?;
+            remember_count(
+                &mut scanned_count,
+                image_count(images),
+                "full scan image count",
+            )
+        },
+    )?;
+    let scanned_count = scanned_count.context("full scan produced no count")?;
     records.push(record(
         "scan.full",
         true,
@@ -124,6 +132,8 @@ pub(crate) fn run_library_scenarios(
         usize_to_u64(scanned_count, "scanned image count")?,
     )?);
 
+    let scanned_by_root = scan_all_sources(&source_roots)?;
+    validate_full_scan(dataset, &scanned_by_root)?;
     let database_dir = run.database_dir();
     let mut libraries = Vec::with_capacity(policy.heavy);
     for sample_index in 0..policy.heavy {
@@ -137,20 +147,24 @@ pub(crate) fn run_library_scenarios(
             fixture: None,
         });
     }
-    let mut import_outcomes = (0..policy.heavy).map(|_| None).collect::<Vec<_>>();
-    let (import_samples, ()) = measure_elapsed(policy.heavy, |sample_index| {
-        import_outcomes[sample_index] = Some(reconcile_full_snapshot(
-            &libraries[sample_index].database,
-            &source_roots,
-            &scanned_by_root,
-        )?);
-        Ok(())
-    })?;
-    let imported_count = validate_reconciliation_samples(
-        &import_outcomes,
-        &scanned_by_root.iter().map(Vec::len).collect::<Vec<_>>(),
-        "atomic import",
+    let expected_imported = scanned_by_root.iter().map(Vec::len).collect::<Vec<_>>();
+    let mut imported_count = None;
+    let import_samples = measure_each_sample(
+        policy.heavy,
+        |sample_index| {
+            reconcile_full_snapshot(
+                &libraries[sample_index].database,
+                &source_roots,
+                &scanned_by_root,
+            )
+        },
+        |_, outcomes| {
+            let imported =
+                validate_reconciliation_outcomes(outcomes, &expected_imported, "atomic import")?;
+            remember_count(&mut imported_count, imported, "atomic import count")
+        },
     )?;
+    let imported_count = imported_count.context("atomic import produced no count")?;
     let initial_source_counts = source_ownership_counts(dataset, &dataset.absolute_paths)?;
     let no_unavailable = vec![0; dataset.source_roots.len()];
     for library in &libraries {
@@ -174,20 +188,20 @@ pub(crate) fn run_library_scenarios(
         library.fixture = Some(prepare_query_fixture(&library.database, dataset)?);
     }
 
-    let mut no_change_outcomes = (0..policy.short).map(|_| None).collect::<Vec<_>>();
-    let (no_change_samples, ()) = measure_elapsed(policy.short, |sample_index| {
-        let library = &libraries[sample_index % libraries.len()];
-        no_change_outcomes[sample_index] = Some(reconcile_full_snapshot(
-            &library.database,
-            &source_roots,
-            &scanned_by_root,
-        )?);
-        Ok(())
-    })?;
-    validate_reconciliation_samples(
-        &no_change_outcomes,
-        &scanned_by_root.iter().map(Vec::len).collect::<Vec<_>>(),
-        "no-change reconciliation",
+    let no_change_samples = measure_each_sample(
+        policy.heavy,
+        |sample_index| {
+            let library = &libraries[sample_index % libraries.len()];
+            reconcile_full_snapshot(&library.database, &source_roots, &scanned_by_root)
+        },
+        |_, outcomes| {
+            validate_reconciliation_outcomes(
+                outcomes,
+                &expected_imported,
+                "no-change reconciliation",
+            )?;
+            Ok(())
+        },
     )?;
     for library in &libraries {
         validate_available_library(&library.database, &dataset.absolute_paths, &[])?;
@@ -231,22 +245,27 @@ pub(crate) fn run_library_scenarios(
         &unavailable_by_root,
     )?;
 
-    let mut incremental_outcomes = (0..policy.heavy).map(|_| None).collect::<Vec<_>>();
-    let (incremental_samples, ()) = measure_elapsed(policy.heavy, |sample_index| {
-        incremental_outcomes[sample_index] = Some(reconcile_incremental(
-            &libraries[sample_index].database,
-            &source_roots,
-            &incremental_roots,
-        )?);
-        Ok(())
-    })?;
-    validate_reconciliation_samples(
-        &incremental_outcomes,
-        &incremental_roots
-            .iter()
-            .map(|root| root.additions.len())
-            .collect::<Vec<_>>(),
-        "incremental reconciliation",
+    let expected_incremental = incremental_roots
+        .iter()
+        .map(|root| root.additions.len())
+        .collect::<Vec<_>>();
+    let incremental_samples = measure_each_sample(
+        policy.heavy,
+        |sample_index| {
+            reconcile_incremental(
+                &libraries[sample_index].database,
+                &source_roots,
+                &incremental_roots,
+            )
+        },
+        |_, outcomes| {
+            validate_reconciliation_outcomes(
+                outcomes,
+                &expected_incremental,
+                "incremental reconciliation",
+            )?;
+            Ok(())
+        },
     )?;
     for library in &libraries {
         validate_available_library(&library.database, &incremental_paths, &mutations.removals)?;
@@ -289,19 +308,24 @@ pub(crate) fn run_library_scenarios(
     validate_scanned_paths(&recovered_images, &recovery_paths, "recovery scan")?;
     let recovery_expected = recovery_paths.len();
     let recovery_sources = source_ownership_counts(dataset, &recovery_paths)?;
-    let mut recovery_outcomes = (0..policy.heavy).map(|_| None).collect::<Vec<_>>();
-    let (recovery_samples, ()) = measure_elapsed(policy.heavy, |sample_index| {
-        recovery_outcomes[sample_index] = Some(reconcile_full_snapshot(
-            &libraries[sample_index].database,
-            &source_roots,
-            &recovered_images,
-        )?);
-        Ok(())
-    })?;
-    validate_reconciliation_samples(
-        &recovery_outcomes,
-        &recovered_images.iter().map(Vec::len).collect::<Vec<_>>(),
-        "recovery reconciliation",
+    let expected_recovery = recovered_images.iter().map(Vec::len).collect::<Vec<_>>();
+    let recovery_samples = measure_each_sample(
+        policy.heavy,
+        |sample_index| {
+            reconcile_full_snapshot(
+                &libraries[sample_index].database,
+                &source_roots,
+                &recovered_images,
+            )
+        },
+        |_, outcomes| {
+            validate_reconciliation_outcomes(
+                outcomes,
+                &expected_recovery,
+                "recovery reconciliation",
+            )?;
+            Ok(())
+        },
     )?;
     for library in &libraries {
         validate_available_library(&library.database, &recovery_paths, &[])?;
@@ -342,85 +366,103 @@ pub(crate) fn run_library_scenarios(
     let database_path = primary.database_path.clone();
     drop(primary.database);
 
-    let (startup_samples, startup_measurement) = measure_elapsed(policy.heavy, |_| {
-        let database = Database::new(&database_path)
-            .with_context(|| format!("reopen startup database {}", database_path.display()))?;
-        let summaries = database.get_watched_folder_summaries()?;
-        let page = database.get_wallpapers_page("all", "created", "", 0, PAGE_LIMIT)?;
-        let stats = database.get_stats()?;
-        Ok(StartupMeasurement {
-            database,
-            snapshot: StartupSnapshot {
-                summaries,
-                page,
-                stats,
-            },
-        })
-    })?;
-    let StartupMeasurement {
-        database: startup_database,
-        snapshot: startup,
-    } = startup_measurement;
-    drop(startup_database);
-    validate_startup_snapshot(
-        dataset,
-        recovery_expected,
-        &recovery_sources,
-        &fixture,
-        &startup,
+    let mut startup_total = None;
+    let startup_samples = measure_each_sample(
+        policy.heavy,
+        |_| {
+            let database = Database::new(&database_path)
+                .with_context(|| format!("reopen startup database {}", database_path.display()))?;
+            let summaries = database.get_watched_folder_summaries()?;
+            let page = database.get_wallpapers_page("all", "created", "", 0, PAGE_LIMIT)?;
+            let stats = database.get_stats()?;
+            Ok(StartupMeasurement {
+                _database: database,
+                snapshot: StartupSnapshot {
+                    summaries,
+                    page,
+                    stats,
+                },
+            })
+        },
+        |_, measurement| {
+            validate_startup_snapshot(
+                dataset,
+                recovery_expected,
+                &recovery_sources,
+                &fixture,
+                &measurement.snapshot,
+            )?;
+            remember_count(
+                &mut startup_total,
+                measurement.snapshot.page.total,
+                "startup page total",
+            )
+        },
     )?;
+    let startup_total = startup_total.context("startup produced no page total")?;
     records.push(record(
         "startup.open-first-page-stats",
         true,
         startup_samples,
         usize_to_u64(recovery_expected, "startup expected count")?,
-        i64_to_u64(startup.page.total, "startup page total")?,
+        i64_to_u64(startup_total, "startup page total")?,
     )?);
 
     let database = Database::new(&database_path)
         .with_context(|| format!("open query database {}", database_path.display()))?;
 
-    let (first_samples, first_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page("all", "created", "", 0, PAGE_LIMIT)
-    })?;
-    validate_page(
-        &first_page,
-        recovery_expected,
-        0,
-        PAGE_LIMIT,
-        recovery_expected > PAGE_LIMIT as usize,
+    let mut first_total = None;
+    let first_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page("all", "created", "", 0, PAGE_LIMIT),
+        |_, page| {
+            validate_page(
+                page,
+                recovery_expected,
+                0,
+                PAGE_LIMIT,
+                recovery_expected > PAGE_LIMIT as usize,
+            )?;
+            remember_count(&mut first_total, page.total, "first-page total")
+        },
     )?;
+    let first_total = first_total.context("first-page query produced no total")?;
     records.push(record(
         "query.page.first",
         true,
         first_samples,
         usize_to_u64(recovery_expected, "first-page expected total")?,
-        i64_to_u64(first_page.total, "first-page total")?,
+        i64_to_u64(first_total, "first-page total")?,
     )?);
 
     let deep_offset = (usize_to_i64(recovery_expected, "deep page total")? - PAGE_LIMIT).max(0);
-    let (deep_samples, deep_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page("all", "created", "", deep_offset, PAGE_LIMIT)
-    })?;
-    validate_page(
-        &deep_page,
-        recovery_expected,
-        deep_offset,
-        PAGE_LIMIT,
-        false,
+    let mut deep_total = None;
+    let deep_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page("all", "created", "", deep_offset, PAGE_LIMIT),
+        |_, page| {
+            validate_page(page, recovery_expected, deep_offset, PAGE_LIMIT, false)?;
+            remember_count(&mut deep_total, page.total, "deep-page total")
+        },
     )?;
+    let deep_total = deep_total.context("deep-page query produced no total")?;
     records.push(record(
         "query.page.deep",
         true,
         deep_samples,
         usize_to_u64(recovery_expected, "deep-page expected total")?,
-        i64_to_u64(deep_page.total, "deep-page total")?,
+        i64_to_u64(deep_total, "deep-page total")?,
     )?);
 
-    let (unicode_samples, unicode_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page("all", "created", TAG_NAME, 0, PAGE_LIMIT)
-    })?;
-    validate_membership_page(&unicode_page, &fixture.unicode_matches, TAG_NAME)?;
+    let mut unicode_total = None;
+    let unicode_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page("all", "created", TAG_NAME, 0, PAGE_LIMIT),
+        |_, page| {
+            validate_membership_page(page, &fixture.unicode_matches, TAG_NAME)?;
+            remember_count(&mut unicode_total, page.total, "Unicode search total")
+        },
+    )?;
     validate_complete_query_membership(
         &database,
         "all",
@@ -429,6 +471,7 @@ pub(crate) fn run_library_scenarios(
         &fixture.unicode_matches,
         "Unicode search",
     )?;
+    let unicode_total = unicode_total.context("Unicode search produced no total")?;
     records.push(record(
         "query.search.unicode",
         true,
@@ -437,32 +480,45 @@ pub(crate) fn run_library_scenarios(
             fixture.unicode_matches.len(),
             "Unicode search expected count",
         )?,
-        i64_to_u64(unicode_page.total, "Unicode search total")?,
+        i64_to_u64(unicode_total, "Unicode search total")?,
     )?);
 
-    let (none_samples, none_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page(
-            "all",
-            "created",
-            "purewall-benchmark-no-match-7a1",
-            0,
-            PAGE_LIMIT,
-        )
-    })?;
-    validate_page(&none_page, 0, 0, PAGE_LIMIT, false)?;
+    let mut none_total = None;
+    let none_samples = measure_each_sample(
+        policy.short,
+        |_| {
+            database.get_wallpapers_page(
+                "all",
+                "created",
+                "purewall-benchmark-no-match-7a1",
+                0,
+                PAGE_LIMIT,
+            )
+        },
+        |_, page| {
+            validate_page(page, 0, 0, PAGE_LIMIT, false)?;
+            remember_count(&mut none_total, page.total, "absent search total")
+        },
+    )?;
+    let none_total = none_total.context("absent search produced no total")?;
     records.push(record(
         "query.search.none",
         true,
         none_samples,
         0,
-        i64_to_u64(none_page.total, "absent search total")?,
+        i64_to_u64(none_total, "absent search total")?,
     )?);
 
     let tag_filter = format!("tag:{}", fixture.tag_id);
-    let (tag_samples, tag_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page(&tag_filter, "liked", "", 0, PAGE_LIMIT)
-    })?;
-    validate_membership_page(&tag_page, &fixture.tagged, "tag filter")?;
+    let mut tag_total = None;
+    let tag_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page(&tag_filter, "liked", "", 0, PAGE_LIMIT),
+        |_, page| {
+            validate_membership_page(page, &fixture.tagged, "tag filter")?;
+            remember_count(&mut tag_total, page.total, "tag-filter total")
+        },
+    )?;
     validate_complete_query_membership(
         &database,
         &tag_filter,
@@ -471,19 +527,25 @@ pub(crate) fn run_library_scenarios(
         &fixture.tagged,
         "tag filter",
     )?;
+    let tag_total = tag_total.context("tag-filter query produced no total")?;
     records.push(record(
         "query.filter.tag",
         true,
         tag_samples,
         usize_to_u64(fixture.tagged.len(), "tag-filter expected count")?,
-        i64_to_u64(tag_page.total, "tag-filter total")?,
+        i64_to_u64(tag_total, "tag-filter total")?,
     )?);
 
     let collection_filter = format!("collection:{}", fixture.collection_id);
-    let (collection_samples, collection_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page(&collection_filter, "recent", "", 0, PAGE_LIMIT)
-    })?;
-    validate_membership_page(&collection_page, &fixture.collected, "collection filter")?;
+    let mut collection_total = None;
+    let collection_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page(&collection_filter, "recent", "", 0, PAGE_LIMIT),
+        |_, page| {
+            validate_membership_page(page, &fixture.collected, "collection filter")?;
+            remember_count(&mut collection_total, page.total, "collection-filter total")
+        },
+    )?;
     validate_complete_query_membership(
         &database,
         &collection_filter,
@@ -492,41 +554,31 @@ pub(crate) fn run_library_scenarios(
         &fixture.collected,
         "collection filter",
     )?;
+    let collection_total = collection_total.context("collection-filter query produced no total")?;
     records.push(record(
         "query.filter.collection",
         true,
         collection_samples,
         usize_to_u64(fixture.collected.len(), "collection-filter expected count")?,
-        i64_to_u64(collection_page.total, "collection-filter total")?,
+        i64_to_u64(collection_total, "collection-filter total")?,
     )?);
 
-    let (plays_samples, plays_page) = measure_elapsed(policy.short, |_| {
-        database.get_wallpapers_page("all", "plays", "", 0, PAGE_LIMIT)
-    })?;
-    validate_page(
-        &plays_page,
-        recovery_expected,
-        0,
-        PAGE_LIMIT,
-        recovery_expected > PAGE_LIMIT as usize,
+    let mut plays_total = None;
+    let plays_samples = measure_each_sample(
+        policy.short,
+        |_| database.get_wallpapers_page("all", "plays", "", 0, PAGE_LIMIT),
+        |_, page| {
+            validate_plays_page(page, recovery_expected, &fixture)?;
+            remember_count(&mut plays_total, page.total, "plays-sort total")
+        },
     )?;
-    ensure!(
-        plays_page
-            .items
-            .windows(2)
-            .all(|pair| pair[0].play_count >= pair[1].play_count),
-        "plays sort is not descending"
-    );
-    ensure!(
-        plays_page.items.iter().all(|entry| entry.play_count == 0),
-        "plays sort returned unexpected play history"
-    );
+    let plays_total = plays_total.context("plays-sort query produced no total")?;
     records.push(record(
         "query.sort.plays",
         true,
         plays_samples,
         usize_to_u64(recovery_expected, "plays-sort expected total")?,
-        i64_to_u64(plays_page.total, "plays-sort total")?,
+        i64_to_u64(plays_total, "plays-sort total")?,
     )?);
 
     database.checkpoint_wal()?;
@@ -663,24 +715,13 @@ fn validate_reconciliation_outcomes(
     Ok(imported)
 }
 
-fn validate_reconciliation_samples(
-    samples: &[Option<Vec<ReconciliationOutcome>>],
-    expected_scanned: &[usize],
-    label: &str,
-) -> Result<usize> {
-    let mut expected_imported = None;
-    for (sample_index, outcomes) in samples.iter().enumerate() {
-        let outcomes = outcomes
-            .as_ref()
-            .with_context(|| format!("{label} sample {sample_index} did not return an outcome"))?;
-        let imported = validate_reconciliation_outcomes(outcomes, expected_scanned, label)?;
-        ensure!(
-            expected_imported.is_none_or(|expected| expected == imported),
-            "{label} sample imported counts differ"
-        );
-        expected_imported.get_or_insert(imported);
-    }
-    expected_imported.context("reconciliation sample set must not be empty")
+fn remember_count<T: Copy + Eq>(observed: &mut Option<T>, value: T, label: &str) -> Result<()> {
+    ensure!(
+        observed.is_none_or(|previous| previous == value),
+        "{label} changed between samples"
+    );
+    observed.get_or_insert(value);
+    Ok(())
 }
 
 fn prepare_incremental_roots(
@@ -812,6 +853,23 @@ fn prepare_query_fixture(database: &Database, dataset: &GeneratedDataset) -> Res
         .into_iter()
         .filter(|path| path.contains(TAG_NAME) || tagged_set.contains(path))
         .collect();
+    let removal_identities = path_identities(&dataset.mutations.removals, "play removal path")?;
+    let played = dataset
+        .absolute_paths
+        .iter()
+        .map(|path| path_text(path, "played fixture path"))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| !removal_identities.contains(&path_identity(path)))
+        .take(2)
+        .zip([3, 1])
+        .collect::<Vec<_>>();
+    ensure!(played.len() == 2, "query fixture requires two stable paths");
+    for (path, play_count) in &played {
+        for _ in 0..*play_count {
+            database.record_play(path)?;
+        }
+    }
 
     Ok(QueryFixture {
         tag_id: tag.id,
@@ -820,6 +878,7 @@ fn prepare_query_fixture(database: &Database, dataset: &GeneratedDataset) -> Res
         collected: collected.into_iter().collect(),
         liked: liked.into_iter().collect(),
         unicode_matches,
+        played,
     })
 }
 
@@ -869,8 +928,13 @@ fn validate_startup_snapshot(
         startup.stats.disliked == 0 && startup.stats.blacklisted == 0,
         "startup stats contain unexpected hidden ratings"
     );
+    let expected_plays = fixture
+        .played
+        .iter()
+        .map(|(_, count)| i64::from(*count))
+        .sum::<i64>();
     ensure!(
-        startup.stats.total_plays == 0,
+        startup.stats.total_plays == expected_plays,
         "startup play count mismatch"
     );
     Ok(())
@@ -1035,6 +1099,15 @@ fn validate_preserved_metadata(
             );
         }
     }
+    for (path, expected_count) in &expected.played {
+        let entry = database
+            .get_wallpaper_by_path(path)?
+            .with_context(|| format!("played metadata row disappeared: {path}"))?;
+        ensure!(
+            entry.play_count == *expected_count,
+            "play count was not preserved"
+        );
+    }
     Ok(())
 }
 
@@ -1131,6 +1204,41 @@ fn validate_page(
         page.items.len()
     );
     validate_existing_items(&page.items)
+}
+
+fn validate_plays_page(
+    page: &WallpaperPage,
+    expected_total: usize,
+    fixture: &QueryFixture,
+) -> Result<()> {
+    validate_page(
+        page,
+        expected_total,
+        0,
+        PAGE_LIMIT,
+        expected_total > PAGE_LIMIT as usize,
+    )?;
+    ensure!(
+        page.items
+            .windows(2)
+            .all(|pair| pair[0].play_count >= pair[1].play_count),
+        "plays sort is not descending"
+    );
+    for (entry, (expected_path, expected_count)) in page.items.iter().zip(&fixture.played) {
+        ensure!(
+            path_identity(&entry.path) == path_identity(expected_path)
+                && entry.play_count == *expected_count,
+            "plays sort did not return the deterministic played paths first"
+        );
+    }
+    ensure!(
+        page.items
+            .iter()
+            .skip(fixture.played.len())
+            .all(|entry| entry.play_count == 0),
+        "plays sort returned unexpected play history"
+    );
+    Ok(())
 }
 
 fn validate_membership_page(
@@ -1296,7 +1404,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
 
-    use super::{measure_elapsed, run_library_scenarios, SamplePolicy};
+    use super::{measure_each_sample, run_library_scenarios, SamplePolicy};
     use crate::performance_harness::dataset::{generate_dataset, DatasetScale, DATASET_SEED};
     use crate::performance_harness::owned_temp::OwnedRunRoot;
     use crate::performance_harness::protocol::RunStatus;
@@ -1358,6 +1466,7 @@ mod tests {
         for id in [
             "scan.full",
             "import.atomic",
+            "reconcile.no-change",
             "reconcile.incremental",
             "reconcile.recovery",
             "startup.open-first-page-stats",
@@ -1365,7 +1474,6 @@ mod tests {
             assert_eq!(by_id[id].samples.elapsed_micros.len(), 1, "{id}");
         }
         for id in [
-            "reconcile.no-change",
             "query.page.first",
             "query.page.deep",
             "query.search.unicode",
@@ -1383,14 +1491,6 @@ mod tests {
 
     #[test]
     fn sample_policy_and_temporary_timer_keep_the_declared_sample_contract() {
-        struct DropProbe<'a>(&'a Cell<usize>);
-
-        impl Drop for DropProbe<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
         let ci = SamplePolicy::ci();
         assert_eq!(ci.heavy, 1);
         assert_eq!(ci.short, 3);
@@ -1401,19 +1501,87 @@ mod tests {
         assert_eq!(standard.short, 20);
         assert_eq!(standard.scenario_timeout.as_secs(), 15 * 60);
 
-        let (samples, last) = measure_elapsed(3, Ok).unwrap();
-        assert_eq!(samples.len(), 3);
-        assert_eq!(last, 2);
-        assert!(measure_elapsed::<()>(0, |_| Ok(())).is_err());
-
-        let drops = Cell::new(0);
-        let (_, last) = measure_elapsed(3, |index| {
-            assert_eq!(drops.get(), index);
-            Ok(DropProbe(&drops))
+        let consumed = Cell::new(0);
+        let samples = measure_each_sample(3, Ok, |index, value| {
+            assert_eq!(*value, index);
+            consumed.set(consumed.get() + 1);
+            Ok(())
         })
         .unwrap();
+        assert_eq!(samples.len(), 3);
+        assert_eq!(consumed.get(), 3);
+        assert!(measure_each_sample::<()>(0, |_| Ok(()), |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn every_sample_is_validated_and_released_before_the_next_operation() {
+        struct SampleProbe<'a> {
+            valid: bool,
+            drops: &'a Cell<usize>,
+        }
+
+        impl Drop for SampleProbe<'_> {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let operations = Cell::new(0);
+        let validations = Cell::new(0);
+        let drops = Cell::new(0);
+        let error = measure_each_sample(
+            3,
+            |index| {
+                assert_eq!(drops.get(), index);
+                operations.set(operations.get() + 1);
+                Ok(SampleProbe {
+                    valid: index != 1,
+                    drops: &drops,
+                })
+            },
+            |index, sample| {
+                validations.set(validations.get() + 1);
+                anyhow::ensure!(sample.valid, "sample {index} is invalid");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("sample 1 is invalid"));
+        assert_eq!(operations.get(), 2);
+        assert_eq!(validations.get(), 2);
         assert_eq!(drops.get(), 2);
-        drop(last);
-        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn query_fixture_assigns_nonzero_distinct_play_counts() {
+        let run = OwnedRunRoot::create_for_test("library-play-counts").unwrap();
+        let result = (|| -> anyhow::Result<(i32, i32)> {
+            let dataset = generate_dataset(&run, DatasetScale::Ci, DATASET_SEED)?;
+            let source_roots = super::canonical_source_roots(&dataset)?;
+            let images = super::scan_all_sources(&source_roots)?;
+            let database_path = run.database_dir().join("play-counts.db");
+            let database = crate::db::Database::new(&database_path)?;
+            super::register_sources(&database, &source_roots)?;
+            let outcomes = super::reconcile_full_snapshot(&database, &source_roots, &images)?;
+            super::validate_reconciliation_outcomes(
+                &outcomes,
+                &images.iter().map(Vec::len).collect::<Vec<_>>(),
+                "play-count fixture import",
+            )?;
+            super::prepare_query_fixture(&database, &dataset)?;
+
+            let page = database.get_wallpapers_page("all", "plays", "", 0, 2)?;
+            anyhow::ensure!(
+                page.items.len() == 2,
+                "play-count fixture page is incomplete"
+            );
+            Ok((page.items[0].play_count, page.items[1].play_count))
+        })();
+        run.cleanup().unwrap();
+
+        let (highest, next) = result.unwrap();
+        assert!(highest > next, "play counts must be different");
+        assert!(next > 0, "at least two play counts must be nonzero");
     }
 }
