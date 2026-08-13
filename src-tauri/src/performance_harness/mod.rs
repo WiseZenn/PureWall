@@ -1,3 +1,8 @@
+#[cfg_attr(not(test), allow(dead_code))]
+mod compare;
+#[cfg_attr(not(test), allow(dead_code))]
+mod protocol;
+
 pub(crate) fn run_if_requested(args: &[String]) -> Option<anyhow::Result<()>> {
     let marker = args.iter().position(|arg| arg == "--performance-harness")?;
     let command = args.get(marker + 1).map(String::as_str).unwrap_or("");
