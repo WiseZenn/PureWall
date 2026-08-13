@@ -12,6 +12,108 @@ use crate::paths::{
 };
 
 impl Database {
+    fn run_immediate_transaction<T, B, C>(&self, body: B, commit: C) -> Result<T>
+    where
+        B: FnOnce() -> Result<T>,
+        C: FnOnce(&rusqlite::Connection) -> Result<()>,
+    {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match body() {
+            Ok(value) => match commit(&self.conn) {
+                Ok(()) => Ok(value),
+                Err(error) => match self.conn.execute_batch("ROLLBACK") {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => {
+                        Err(error.context(format!("transaction rollback failed: {rollback_error}")))
+                    }
+                },
+            },
+            Err(error) => match self.conn.execute_batch("ROLLBACK") {
+                Ok(()) => Err(error),
+                Err(rollback_error) => {
+                    Err(error.context(format!("transaction rollback failed: {rollback_error}")))
+                }
+            },
+        }
+    }
+
+    pub(crate) fn reconcile_watched_paths_atomically(
+        &self,
+        root: &str,
+        source: &str,
+        missing_paths: &[String],
+        images: &[crate::scanner::ImageInfo],
+        full_snapshot: bool,
+    ) -> Result<crate::ReconciliationOutcome> {
+        self.run_immediate_transaction(
+            || {
+            let registered_root = self
+                .get_watched_folders()?
+                .into_iter()
+                .find(|entry| {
+                    path_identity_key(Path::new(&entry.path))
+                        == path_identity_key(Path::new(root))
+                        && entry.source == source
+                })
+                .map(|entry| entry.path);
+            let Some(registered_root) = registered_root else {
+                return Ok(crate::ReconciliationOutcome::SkippedStale);
+            };
+            let existing = {
+                let mut statement = self
+                    .conn
+                    .prepare("SELECT id, path FROM wallpapers WHERE file_available = 1")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let snapshot_paths = full_snapshot.then(|| {
+                images
+                    .iter()
+                    .map(|image| path_identity_key(Path::new(&image.path)))
+                    .collect::<HashSet<_>>()
+            });
+            for (id, path) in existing {
+                let explicitly_missing = missing_paths
+                    .iter()
+                    .any(|missing| {
+                        path_is_same_or_descendant(Path::new(missing), Path::new(root))
+                            && path_is_same_or_descendant(Path::new(&path), Path::new(missing))
+                    });
+                let absent_from_snapshot = snapshot_paths.as_ref().is_some_and(|snapshot_paths| {
+                    path_is_same_or_descendant(Path::new(&path), Path::new(root))
+                        && !snapshot_paths.contains(&path_identity_key(Path::new(&path)))
+                });
+                if explicitly_missing || absent_from_snapshot {
+                    self.conn.execute(
+                        "UPDATE wallpapers SET file_available = 0 WHERE id = ?1",
+                        [id],
+                    )?;
+                }
+            }
+            let mut imported = 0;
+            for image in images {
+                self.conn.execute(
+                    "INSERT INTO wallpapers (path, hash, source, width, height, file_size)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(path) DO UPDATE SET hash = ?2, source = ?3, width = ?4, height = ?5, file_size = ?6, file_available = 1",
+                    params![image.path, image.hash, source, image.width, image.height, image.file_size],
+                )?;
+                imported += 1;
+            }
+            self.conn.execute("UPDATE watched_folders SET last_scan_at = datetime('now'), last_error = NULL WHERE path = ?1", [registered_root])?;
+            Ok(crate::ReconciliationOutcome::Applied(crate::ImportResult {
+                scanned: images.len(),
+                imported,
+            }))
+            },
+            |connection| connection.execute_batch("COMMIT").map_err(Into::into),
+        )
+    }
+
     pub fn upsert_watched_folder(&self, path: &str, source: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO watched_folders (path, source) VALUES (?1, ?2)
@@ -484,5 +586,156 @@ impl Database {
         }
 
         Ok(registered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_database(test_name: &str) -> (PathBuf, Database) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "purewall-db-sources-{test_name}-{}-{nanos}.db",
+            std::process::id()
+        ));
+        let database = Database::new(&path).expect("database should initialize");
+        (path, database)
+    }
+
+    fn remove_database_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn immediate_transaction_rolls_back_body_failure() {
+        let (path, database) = temp_database("body-rollback");
+        let result: anyhow::Result<()> = database.run_immediate_transaction(
+            || {
+                database.conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('watcher-body', 'dirty')",
+                    [],
+                )?;
+                anyhow::bail!("injected body failure")
+            },
+            |connection| connection.execute_batch("COMMIT").map_err(Into::into),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(database.get_setting("watcher-body").unwrap(), None);
+        drop(database);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn immediate_transaction_rolls_back_commit_failure() {
+        let (path, database) = temp_database("commit-rollback");
+        let result = database.run_immediate_transaction(
+            || {
+                database.conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ('watcher-commit', 'dirty')",
+                    [],
+                )?;
+                Ok(())
+            },
+            |_connection| anyhow::bail!("injected commit failure"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(database.get_setting("watcher-commit").unwrap(), None);
+        drop(database);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn stale_source_work_cannot_commit_after_source_replacement() {
+        let (path, database) = temp_database("stale-source-owner");
+        let root = path.with_extension("watched-root");
+        let root = root.to_string_lossy().to_string();
+        let image_path = Path::new(&root)
+            .join("stale.jpg")
+            .to_string_lossy()
+            .to_string();
+        database
+            .upsert_watched_folder(&root, "mounted")
+            .expect("initial source should register");
+        database
+            .record_watched_folder_error(&root, "new owner remains unresolved")
+            .expect("source state should persist");
+        database
+            .upsert_watched_folder(&root, "imported-folder")
+            .expect("source owner should be replaced");
+
+        let result = database
+            .reconcile_watched_paths_atomically(
+                &root,
+                "mounted",
+                &[],
+                &[crate::scanner::ImageInfo {
+                    path: image_path.clone(),
+                    hash: "stale-hash".to_string(),
+                    width: 1920,
+                    height: 1080,
+                    file_size: 42,
+                }],
+                true,
+            )
+            .expect("stale work should resolve as an authorized no-op");
+
+        assert!(matches!(result, crate::ReconciliationOutcome::SkippedStale));
+        assert!(database
+            .get_wallpaper_by_path(&image_path)
+            .expect("wallpaper lookup should succeed")
+            .is_none());
+        let registration = database
+            .get_watched_folders()
+            .expect("watched source lookup should succeed")
+            .into_iter()
+            .find(|folder| folder.path == root)
+            .expect("replacement source should remain registered");
+        assert_eq!(registration.source, "imported-folder");
+        assert_eq!(
+            registration.last_error.as_deref(),
+            Some("new owner remains unresolved")
+        );
+
+        drop(database);
+        remove_database_files(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn successful_alias_reconciliation_clears_the_registered_root_episode() {
+        let (path, database) = temp_database("registered-root-alias");
+        let registered_root = r"D:\Walls";
+        database
+            .upsert_watched_folder(registered_root, "mounted")
+            .expect("source should register");
+        database
+            .record_watched_folder_error(registered_root, "watcher degraded")
+            .expect("failure episode should persist");
+
+        database
+            .reconcile_watched_paths_atomically(r"d:/walls\", "mounted", &[], &[], false)
+            .expect("identity-equivalent root should reconcile");
+
+        let registration = database
+            .get_watched_folders()
+            .expect("watched source lookup should succeed")
+            .into_iter()
+            .find(|folder| folder.path == registered_root)
+            .expect("registered source should remain");
+        assert!(registration.last_error.is_none());
+        assert!(registration.last_scan_at.is_some());
+
+        drop(database);
+        remove_database_files(&path);
     }
 }

@@ -1003,7 +1003,10 @@ export const useWallpaperStore = defineStore("wallpapers", () => {
             );
           }
         }),
-        listen<OperationFailedPayload>("operation-failed", (event) => {
+        listen<OperationFailedPayload>("operation-failed", async (event) => {
+          if (event.payload.kind === "source-sync") {
+            await loadLibrarySources();
+          }
           notify(event.payload.title, event.payload.message, "error");
         }),
       ]);

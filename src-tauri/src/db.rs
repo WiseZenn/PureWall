@@ -6,11 +6,17 @@ use crate::library_backup::{
 };
 use crate::paths::path_identity_key;
 use anyhow::{Context, Result};
-use rusqlite::{params, params_from_iter, types::Value, Connection, Row};
+use rusqlite::{
+    backup::{Backup, StepResult},
+    params, params_from_iter,
+    types::Value,
+    Connection, Row, TransactionBehavior,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::Duration;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[path = "db_backup.rs"]
 mod db_backup;
@@ -202,94 +208,370 @@ where
     selected
 }
 
+const BACKUP_STEP_PAGES: i32 = 128;
+const BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const BACKUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct TemporaryBackup {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl TemporaryBackup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn publish(mut self, final_path: &Path) -> Result<()> {
+        fs::hard_link(&self.path, final_path).with_context(|| {
+            format!(
+                "Failed to publish SQLite migration backup without overwriting {}; temporary copy was at {}, and cleanup will be attempted",
+                final_path.display(),
+                self.path.display()
+            )
+        })?;
+        fs::remove_file(&self.path).with_context(|| {
+            format!(
+                "Published SQLite migration backup at {}, but could not remove temporary copy {}; preserve both paths and resolve manually",
+                final_path.display(),
+                self.path.display()
+            )
+        })?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryBackup {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn migration_backup_paths(db_path: &Path, from: i64, to: i64) -> (PathBuf, PathBuf) {
+    let name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("purewall.db");
+    let stem = format!("{name}.pre-migration-v{from}-to-v{to}.bak");
+    let final_path = db_path.with_file_name(stem);
+    let temp_path = PathBuf::from(format!("{}.tmp", final_path.display()));
+    (final_path, temp_path)
+}
+
+fn quick_check(conn: &Connection, path: &Path) -> Result<()> {
+    let mut statement = conn.prepare("PRAGMA quick_check").with_context(|| {
+        format!(
+            "Failed to prepare SQLite quick_check for {}",
+            path.display()
+        )
+    })?;
+    let mut rows = statement
+        .query([])
+        .with_context(|| format!("Failed to run SQLite quick_check for {}", path.display()))?;
+    let mut diagnostics = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .with_context(|| format!("Failed to read SQLite quick_check for {}", path.display()))?
+    {
+        diagnostics.push(row.get::<_, String>(0).with_context(|| {
+            format!("Failed to decode SQLite quick_check for {}", path.display())
+        })?);
+    }
+    if diagnostics.len() == 1 && diagnostics[0] == "ok" {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "SQLite quick_check failed for {}: {}",
+            path.display(),
+            diagnostics.join("; ")
+        ))
+    }
+}
+
+fn has_user_objects(conn: &Connection, path: &Path) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+        )",
+        [],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("Failed to inspect SQLite objects for {}", path.display()))
+}
+
+fn validate_backup(path: &Path, expected_version: i64) -> Result<()> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "Failed to open existing SQLite backup read-only {}",
+                path.display()
+            )
+        })?;
+    conn.busy_timeout(Duration::from_secs(5)).with_context(|| {
+        format!(
+            "Failed to set busy timeout for SQLite backup {}",
+            path.display()
+        )
+    })?;
+    quick_check(&conn, path)?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .with_context(|| format!("Failed to read SQLite backup version {}", path.display()))?;
+    if version != expected_version {
+        return Err(anyhow::anyhow!(
+            "SQLite migration backup {} has schema version {version}, expected {expected_version}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn create_migration_backup(
+    source: &Connection,
+    db_path: &Path,
+    from: i64,
+    to: i64,
+) -> Result<PathBuf> {
+    let (final_path, temp_path) = migration_backup_paths(db_path, from, to);
+    match fs::remove_file(&temp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to remove stale temporary SQLite migration backup {}",
+                    temp_path.display()
+                )
+            });
+        }
+    }
+    if final_path.exists() {
+        validate_backup(&final_path, from).with_context(|| {
+            format!(
+                "Refusing to overwrite invalid or incompatible SQLite migration backup {}",
+                final_path.display()
+            )
+        })?;
+        return Ok(final_path);
+    }
+    let cleanup = TemporaryBackup::new(temp_path.clone());
+    let mut destination = Connection::open(&temp_path).with_context(|| {
+        format!(
+            "Failed to create temporary SQLite migration backup {}",
+            temp_path.display()
+        )
+    })?;
+    destination
+        .busy_timeout(Duration::from_secs(5))
+        .with_context(|| {
+            format!(
+                "Failed to set temporary backup busy timeout {}",
+                temp_path.display()
+            )
+        })?;
+    let backup = Backup::new(source, &mut destination).with_context(|| {
+        format!(
+            "Failed to initialize SQLite online backup to {}",
+            temp_path.display()
+        )
+    })?;
+    let started_at = Instant::now();
+    let mut blocked_since = None;
+    loop {
+        if started_at.elapsed() >= BACKUP_TOTAL_TIMEOUT {
+            return Err(anyhow::anyhow!(
+                "Timed out after {} seconds while copying SQLite online backup; temporary copy was at {}, and cleanup will be attempted; final path is {}",
+                BACKUP_TOTAL_TIMEOUT.as_secs(),
+                temp_path.display(),
+                final_path.display()
+            ));
+        }
+        match backup.step(BACKUP_STEP_PAGES).with_context(|| {
+            format!(
+                "Failed while copying SQLite migration backup to {}; final path is {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })? {
+            StepResult::Done => break,
+            StepResult::More => {
+                blocked_since = None;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            StepResult::Busy | StepResult::Locked => {
+                let blocked_at = blocked_since.get_or_insert_with(Instant::now);
+                if blocked_at.elapsed() >= BACKUP_BUSY_TIMEOUT {
+                    return Err(anyhow::anyhow!(
+                        "Timed out after {} seconds waiting for SQLite online backup; temporary copy was at {}, and cleanup will be attempted; final path is {}",
+                        BACKUP_BUSY_TIMEOUT.as_secs(),
+                        temp_path.display(),
+                        final_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "SQLite online backup returned an unknown state; temporary copy was at {}, and cleanup will be attempted; final path is {}",
+                    temp_path.display(),
+                    final_path.display()
+                ));
+            }
+        }
+    }
+    drop(backup);
+    drop(destination);
+    validate_backup(&temp_path, from)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "Failed to open SQLite backup for sync {}",
+                temp_path.display()
+            )
+        })?
+        .sync_all()
+        .with_context(|| format!("Failed to sync SQLite backup {}", temp_path.display()))?;
+    cleanup.publish(&final_path)?;
+    Ok(final_path)
+}
+
 impl Database {
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(db_path).context("Failed to open database")?;
+        let db_path = db_path.as_ref();
+        let existed_before_open = db_path.exists();
+        let mut conn = Connection::open(db_path).context("Failed to open database")?;
+        let found_schema_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .context("Failed to read SQLite schema version")?;
+        if found_schema_version > SCHEMA_VERSION {
+            return Err(anyhow::anyhow!(
+                "Unsupported SQLite schema version {found_schema_version}; this PureWall build supports up to {SCHEMA_VERSION}"
+            ));
+        }
         conn.busy_timeout(Duration::from_secs(5))
             .context("Failed to set SQLite busy timeout")?;
+
+        let needs_migration = found_schema_version < SCHEMA_VERSION;
+        let migration_safety_backup =
+            if needs_migration && existed_before_open && has_user_objects(&conn, db_path)? {
+                quick_check(&conn, db_path)?;
+                Some(create_migration_backup(
+                    &conn,
+                    db_path,
+                    found_schema_version,
+                    SCHEMA_VERSION,
+                )?)
+            } else {
+                None
+            };
+
+        if needs_migration {
+            let migration_result = (|| -> Result<()> {
+                let transaction = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .context("Failed to begin transactional SQLite migration")?;
+                transaction
+                    .execute_batch(
+                        "CREATE TABLE IF NOT EXISTS wallpapers (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        path TEXT UNIQUE NOT NULL,
+                        hash TEXT NOT NULL DEFAULT '',
+                        source TEXT NOT NULL DEFAULT 'mounted',
+                        display_title TEXT NOT NULL DEFAULT '',
+                        rating INTEGER NOT NULL DEFAULT 0,
+                        play_count INTEGER NOT NULL DEFAULT 0,
+                        last_played TEXT,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        blacklisted INTEGER NOT NULL DEFAULT 0,
+                        width INTEGER NOT NULL DEFAULT 0,
+                        height INTEGER NOT NULL DEFAULT 0,
+                        file_size INTEGER NOT NULL DEFAULT 0,
+                        file_available INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE TABLE IF NOT EXISTS tags (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        color TEXT NOT NULL DEFAULT '#0a84ff',
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE TABLE IF NOT EXISTS collections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE NOT NULL,
+                        color TEXT NOT NULL DEFAULT '#0a84ff',
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE TABLE IF NOT EXISTS wallpaper_tags (
+                        wallpaper_id INTEGER NOT NULL,
+                        tag_id INTEGER NOT NULL,
+                        PRIMARY KEY (wallpaper_id, tag_id),
+                        FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE,
+                        FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS collection_wallpapers (
+                        collection_id INTEGER NOT NULL,
+                        wallpaper_id INTEGER NOT NULL,
+                        PRIMARY KEY (collection_id, wallpaper_id),
+                        FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                        FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE IF NOT EXISTS play_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        wallpaper_id INTEGER,
+                        display_id TEXT,
+                        played_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE SET NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS watched_folders (
+                        path TEXT PRIMARY KEY,
+                        source TEXT NOT NULL CHECK(source IN ('mounted', 'imported-folder')),
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        last_scan_at TEXT,
+                        last_error TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );",
+                    )
+                    .context("Failed to create base SQLite schema inside migration transaction")?;
+                Self::migrate(&transaction)
+                    .context("Failed to migrate SQLite schema transactionally")?;
+                Self::create_indexes(&transaction)
+                    .context("Failed to create SQLite indexes transactionally")?;
+                Self::foreign_key_check(&transaction)
+                    .context("SQLite foreign_key_check failed during migration")?;
+                transaction
+                    .pragma_update(None, "user_version", SCHEMA_VERSION)
+                    .context("Failed to set SQLite schema version transactionally")?;
+                transaction
+                    .commit()
+                    .context("Failed to commit transactional SQLite migration")?;
+                Ok(())
+            })();
+            if let Err(error) = migration_result {
+                if let Some(backup_path) = migration_safety_backup.as_ref() {
+                    return Err(error.context(format!(
+                        "SQLite migration failed; safety backup retained at {}",
+                        backup_path.display()
+                    )));
+                }
+                return Err(error);
+            }
+        }
+
         conn.pragma_update(None, "journal_mode", "WAL")
             .context("Failed to enable SQLite WAL mode")?;
         conn.pragma_update(None, "wal_autocheckpoint", "1000")
             .context("Failed to set SQLite WAL autocheckpoint")?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .context("Failed to enable SQLite foreign keys")?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS wallpapers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                path TEXT UNIQUE NOT NULL,
-                hash TEXT NOT NULL DEFAULT '',
-                source TEXT NOT NULL DEFAULT 'mounted',
-                display_title TEXT NOT NULL DEFAULT '',
-                rating INTEGER NOT NULL DEFAULT 0,
-                play_count INTEGER NOT NULL DEFAULT 0,
-                last_played TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                blacklisted INTEGER NOT NULL DEFAULT 0,
-                width INTEGER NOT NULL DEFAULT 0,
-                height INTEGER NOT NULL DEFAULT 0,
-                file_size INTEGER NOT NULL DEFAULT 0,
-                file_available INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS tags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                color TEXT NOT NULL DEFAULT '#0a84ff',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS collections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                color TEXT NOT NULL DEFAULT '#0a84ff',
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS wallpaper_tags (
-                wallpaper_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                PRIMARY KEY (wallpaper_id, tag_id),
-                FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE,
-                FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS collection_wallpapers (
-                collection_id INTEGER NOT NULL,
-                wallpaper_id INTEGER NOT NULL,
-                PRIMARY KEY (collection_id, wallpaper_id),
-                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
-                FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS play_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wallpaper_id INTEGER,
-                display_id TEXT,
-                played_at TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (wallpaper_id) REFERENCES wallpapers(id) ON DELETE SET NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS watched_folders (
-                path TEXT PRIMARY KEY,
-                source TEXT NOT NULL CHECK(source IN ('mounted', 'imported-folder')),
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_scan_at TEXT,
-                last_error TEXT
-            );
-
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            ",
-        )?;
-
-        Self::migrate(&conn)?;
-        Self::create_indexes(&conn)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .context("Failed to set SQLite schema version")?;
 
         let db = Self { conn };
         db.maybe_vacuum()?;
@@ -350,24 +632,13 @@ impl Database {
             wallpapers
         };
 
-        conn.execute_batch("BEGIN")?;
-        let result: Result<()> = (|| {
-            for (id, path) in wallpapers {
-                conn.execute(
-                    "UPDATE wallpapers SET file_available = ?1 WHERE id = ?2",
-                    params![if Path::new(&path).is_file() { 1 } else { 0 }, id],
-                )?;
-            }
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
-            Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
+        for (id, path) in wallpapers {
+            conn.execute(
+                "UPDATE wallpapers SET file_available = ?1 WHERE id = ?2",
+                params![if Path::new(&path).is_file() { 1 } else { 0 }, id],
+            )?;
         }
+        Ok(())
     }
 
     fn create_indexes(conn: &Connection) -> Result<()> {
@@ -405,13 +676,8 @@ impl Database {
     }
 
     fn rebuild_child_tables_with_foreign_keys(conn: &Connection) -> Result<()> {
-        conn.pragma_update(None, "foreign_keys", "OFF")
-            .context("Failed to disable SQLite foreign keys for migration")?;
-        // Wrap the destructive DROP/RENAME sequence in a transaction so a
-        // crash between DROP and RENAME does not lose data (MED-06).
         conn.execute_batch(
-            "BEGIN;
-            CREATE TABLE IF NOT EXISTS wallpaper_tags_new (
+            "CREATE TABLE IF NOT EXISTS wallpaper_tags_new (
                 wallpaper_id INTEGER NOT NULL,
                 tag_id INTEGER NOT NULL,
                 PRIMARY KEY (wallpaper_id, tag_id),
@@ -445,11 +711,23 @@ impl Database {
             LEFT JOIN wallpapers w ON w.id = pe.wallpaper_id;
 
             DROP TABLE play_events;
-            ALTER TABLE play_events_new RENAME TO play_events;
-            COMMIT;",
+            ALTER TABLE play_events_new RENAME TO play_events;",
         )?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .context("Failed to re-enable SQLite foreign keys after migration")?;
+        Ok(())
+    }
+
+    fn foreign_key_check(conn: &Connection) -> Result<()> {
+        let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = statement.query([])?;
+        if let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            let row_id: Option<i64> = row.get(1)?;
+            let parent: String = row.get(2)?;
+            let foreign_key_id: i64 = row.get(3)?;
+            return Err(anyhow::anyhow!(
+                "foreign key violation in table {table}, row {row_id:?}, parent {parent}, constraint {foreign_key_id}"
+            ));
+        }
         Ok(())
     }
 
@@ -591,6 +869,16 @@ impl Database {
             has_more: offset.saturating_add(limit) < total,
         })
     }
+    pub fn has_registered_wallpaper(&self, path: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM wallpapers WHERE path = ?1)",
+                [path],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn get_wallpaper_by_path(&self, path: &str) -> Result<Option<WallpaperEntry>> {
         let sql = format!("{WALLPAPER_SELECT} WHERE wallpapers.path = ?1");
         let mut entries = self.query_wallpapers_with_str(&sql, path)?;
@@ -809,10 +1097,16 @@ impl Database {
         })();
 
         match result {
-            Ok(()) => self.conn.execute_batch("COMMIT").map_err(Into::into),
-            Err(e) => {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -911,15 +1205,21 @@ impl Database {
 
     pub fn record_play_for_display(&self, path: &str, display_id: Option<&str>) -> Result<()> {
         let wallpaper_id = self.wallpaper_id(path)?;
-        self.conn.execute(
+        // Keep the aggregate counter and the per-display event history atomic so
+        // a failure between the two statements cannot diverge yearly stats.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("Failed to begin play-record transaction")?;
+        tx.execute(
             "UPDATE wallpapers SET play_count = play_count + 1, last_played = datetime('now') WHERE id = ?1",
             [wallpaper_id],
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO play_events (wallpaper_id, display_id) VALUES (?1, ?2)",
             params![wallpaper_id, display_id],
         )?;
-        Ok(())
+        tx.commit().context("Failed to commit play record")
     }
 
     pub fn get_yearly_stats(&self, year: i32) -> Result<YearlyStats> {
@@ -1563,6 +1863,34 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        for from in 0..=SCHEMA_VERSION {
+            let (backup, temp) = migration_backup_paths(path, from, SCHEMA_VERSION);
+            let _ = std::fs::remove_file(backup);
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+
+    fn migration_backup_path(path: &Path, from: i64) -> PathBuf {
+        migration_backup_paths(path, from, SCHEMA_VERSION).0
+    }
+
+    fn migration_temp_path(path: &Path, from: i64) -> PathBuf {
+        migration_backup_paths(path, from, SCHEMA_VERSION).1
+    }
+
+    fn assert_no_migration_artifacts(path: &Path) {
+        for from in 0..=SCHEMA_VERSION {
+            assert!(!migration_backup_path(path, from).exists());
+            assert!(!migration_temp_path(path, from).exists());
+        }
+    }
+
+    struct SqliteFixtureCleanup(PathBuf);
+
+    impl Drop for SqliteFixtureCleanup {
+        fn drop(&mut self) {
+            remove_sqlite_files(&self.0);
+        }
     }
 
     fn relocation_roots(
@@ -1586,6 +1914,365 @@ mod tests {
             .to_string_lossy()
             .to_string();
         (base, old_dir, new_dir, old_root, new_root)
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_mutating_database() {
+        let db_path = unique_temp_db_path("future-schema");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let future_version = SCHEMA_VERSION + 1;
+        let sentinel_schema;
+        let sentinel_data;
+        {
+            let conn = Connection::open(&db_path).expect("future database should open");
+            conn.execute_batch(
+                "CREATE TABLE future_schema_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO future_schema_sentinel (id, value)
+                VALUES (1, 'do-not-mutate');",
+            )
+            .expect("future sentinel should be created");
+            conn.pragma_update(None, "user_version", future_version)
+                .expect("future schema version should be written");
+            sentinel_schema = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'future_schema_sentinel'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("sentinel schema should be readable");
+            sentinel_data = conn
+                .query_row(
+                    "SELECT value FROM future_schema_sentinel WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("sentinel data should be readable");
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .expect("future schema version should be readable"),
+                future_version
+            );
+        }
+
+        let before_bytes =
+            std::fs::read(&db_path).expect("future database bytes should be readable");
+        let error = match Database::new(&db_path) {
+            Ok(_) => panic!("future schema should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Unsupported SQLite schema version {future_version}; this PureWall build supports up to {SCHEMA_VERSION}"
+            )
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("database bytes should remain readable"),
+            before_bytes,
+            "rejecting a future schema must not mutate database bytes"
+        );
+
+        let read_only =
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("future database should reopen read-only");
+        assert_eq!(
+            read_only
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version should remain readable"),
+            future_version
+        );
+        assert_eq!(
+            read_only
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'future_schema_sentinel'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("sentinel schema should remain readable"),
+            sentinel_schema
+        );
+        assert_eq!(
+            read_only
+                .query_row(
+                    "SELECT value FROM future_schema_sentinel WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("sentinel data should remain readable"),
+            sentinel_data
+        );
+        drop(read_only);
+        assert_no_migration_artifacts(&db_path);
+    }
+
+    #[test]
+    fn fresh_and_current_schema_do_not_create_migration_backups() {
+        let db_path = unique_temp_db_path("fresh-no-backup");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let db = Database::new(&db_path).expect("fresh database should initialize");
+        drop(db);
+        assert_no_migration_artifacts(&db_path);
+
+        let db = Database::new(&db_path).expect("current database should reopen");
+        drop(db);
+        assert_no_migration_artifacts(&db_path);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn v6_wal_database_migrates_with_valid_adjacent_backup() {
+        let db_path = unique_temp_db_path("wal-migration-backup");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let wal_source = Connection::open(&db_path).expect("legacy database should open");
+        wal_source
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("legacy database should use WAL");
+        wal_source
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("legacy database should disable autocheckpoint");
+        wal_source
+            .execute_batch(
+                "CREATE TABLE migration_sentinel (value TEXT NOT NULL);
+                 INSERT INTO migration_sentinel(value) VALUES ('committed-in-wal');
+                 PRAGMA user_version = 6;",
+            )
+            .expect("legacy sentinel should be committed");
+        assert!(
+            db_path.with_extension("db-wal").exists(),
+            "committed legacy data should remain in the WAL sidecar"
+        );
+        let db = Database::new(&db_path).expect("legacy database should migrate");
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("source schema version should be readable"),
+            SCHEMA_VERSION
+        );
+        drop(db);
+
+        let backup_path = migration_backup_path(&db_path, 6);
+        assert!(backup_path.exists(), "migration backup should be published");
+        assert!(!migration_temp_path(&db_path, 6).exists());
+        let backup = Connection::open(&backup_path).expect("backup should open");
+        quick_check(&backup, &backup_path).expect("backup should pass quick_check");
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("backup version should be readable"),
+            6
+        );
+        assert_eq!(
+            backup
+                .query_row("SELECT value FROM migration_sentinel", [], |row| row
+                    .get::<_, String>(0),)
+                .expect("WAL sentinel should be in backup"),
+            "committed-in-wal"
+        );
+        drop(backup);
+        drop(wal_source);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn valid_existing_migration_backup_is_reused_without_temp() {
+        let db_path = unique_temp_db_path("reuse-migration-backup");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let source = Connection::open(&db_path).expect("source should open");
+        source
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('x'); PRAGMA user_version = 6;",
+            )
+            .expect("source should seed");
+        let backup_path = migration_backup_path(&db_path, 6);
+        create_migration_backup(&source, &db_path, 6, SCHEMA_VERSION)
+            .expect("initial backup should publish");
+        let before = std::fs::read(&backup_path).expect("backup bytes should be readable");
+        std::fs::write(migration_temp_path(&db_path, 6), b"stale temporary copy")
+            .expect("stale temporary backup should be seedable");
+        create_migration_backup(&source, &db_path, 6, SCHEMA_VERSION)
+            .expect("valid backup should be reusable");
+        assert_eq!(
+            std::fs::read(&backup_path).expect("reused backup bytes should be readable"),
+            before
+        );
+        assert!(!migration_temp_path(&db_path, 6).exists());
+        drop(source);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn invalid_migration_backup_collision_fails_without_clobbering() {
+        let db_path = unique_temp_db_path("collision-migration-backup");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let source = Connection::open(&db_path).expect("source should open");
+        source
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES ('source');",
+            )
+            .expect("source should seed");
+        let source_before = std::fs::read(&db_path).expect("source bytes should be readable");
+        let backup_path = migration_backup_path(&db_path, 6);
+        let collision = Connection::open(&backup_path).expect("collision should open");
+        collision
+            .execute_batch("CREATE TABLE collision(value TEXT); PRAGMA user_version = 99;")
+            .expect("collision should seed");
+        drop(collision);
+        let backup_before =
+            std::fs::read(&backup_path).expect("collision bytes should be readable");
+        let error = create_migration_backup(&source, &db_path, 6, SCHEMA_VERSION)
+            .expect_err("wrong-version collision must fail closed");
+        assert!(error
+            .to_string()
+            .contains(&backup_path.display().to_string()));
+        assert_eq!(
+            std::fs::read(&db_path).expect("source should remain"),
+            source_before
+        );
+        assert_eq!(
+            std::fs::read(&backup_path).expect("collision should remain"),
+            backup_before
+        );
+        assert!(!migration_temp_path(&db_path, 6).exists());
+        drop(source);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn migration_backup_publish_collision_preserves_final_and_cleans_temp() {
+        let db_path = unique_temp_db_path("publish-collision");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let (final_path, temp_path) = migration_backup_paths(&db_path, 6, SCHEMA_VERSION);
+        let final_before = b"existing-final-backup";
+        std::fs::write(&final_path, final_before).expect("final collision should be seeded");
+        std::fs::write(&temp_path, b"temporary-candidate")
+            .expect("temporary candidate should be seeded");
+
+        let error = TemporaryBackup::new(temp_path.clone())
+            .publish(&final_path)
+            .expect_err("publish must fail without overwriting an existing final backup");
+
+        assert_eq!(
+            std::fs::read(&final_path).expect("final collision should remain readable"),
+            final_before,
+            "publish collision must preserve the existing final backup"
+        );
+        assert!(
+            !temp_path.exists(),
+            "consumed TemporaryBackup guard should clean the temporary candidate"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&final_path.display().to_string()));
+        assert!(message.contains(&temp_path.display().to_string()));
+    }
+
+    #[test]
+    fn quick_check_failure_precedes_backup_and_migration() {
+        let db_path = unique_temp_db_path("quick-check-failure");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let conn = Connection::open(&db_path).expect("corrupt fixture should open");
+        conn.execute_batch(
+            "CREATE TABLE checked(value INTEGER);
+             INSERT INTO checked VALUES (-1);
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_master SET sql = 'CREATE TABLE checked(value INTEGER CHECK(value > 0))' WHERE name = 'checked';
+             PRAGMA schema_version = 2;
+             PRAGMA writable_schema = OFF;
+             PRAGMA user_version = 6;",
+        )
+        .expect("corrupt fixture should seed");
+        drop(conn);
+        let before = std::fs::read(&db_path).expect("fixture bytes should be readable");
+        let error = match Database::new(&db_path) {
+            Ok(_) => panic!("quick_check should reject fixture"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("quick_check"));
+        assert_eq!(
+            std::fs::read(&db_path).expect("fixture should remain"),
+            before
+        );
+        assert_no_migration_artifacts(&db_path);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn late_migration_failure_rolls_back_earlier_schema_changes() {
+        let db_path = unique_temp_db_path("late-migration-failure");
+        let _cleanup = SqliteFixtureCleanup(db_path.clone());
+        remove_sqlite_files(&db_path);
+        let conn = Connection::open(&db_path).expect("legacy fixture should open");
+        conn.execute_batch(
+            "CREATE TABLE wallpapers (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, hash TEXT NOT NULL, source TEXT NOT NULL);
+             CREATE TABLE tags (name TEXT);
+             CREATE TABLE wallpaper_tags (wallpaper_id INTEGER, tag_id INTEGER);
+             PRAGMA user_version = 4;
+             INSERT INTO wallpapers(path, hash, source) VALUES ('missing.jpg', 'h', 'mounted');",
+        )
+        .expect("late-failure fixture should seed");
+        drop(conn);
+        let backup_path = migration_backup_path(&db_path, 4);
+        let error = match Database::new(&db_path) {
+            Ok(_) => panic!("malformed child migration should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("SQLite migration failed"));
+        assert!(error.to_string().contains(&format!(
+            "safety backup retained at {}",
+            backup_path.display()
+        )));
+        let source = Connection::open(&db_path).expect("rolled-back source should open");
+        assert_eq!(
+            source
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("source version should remain old"),
+            4
+        );
+        let columns: Vec<String> = source
+            .prepare("PRAGMA table_info(wallpapers)")
+            .expect("columns should prepare")
+            .query_map([], |row| row.get(1))
+            .expect("columns should query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("columns should collect");
+        assert!(!columns.contains(&"blacklisted".to_string()));
+        assert!(!source
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'idx_wallpapers_rating')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("index state should be readable"));
+        assert_eq!(
+            source
+                .query_row("SELECT path FROM wallpapers", [], |row| row
+                    .get::<_, String>(0))
+                .expect("rolled-back source row should remain"),
+            "missing.jpg"
+        );
+        drop(source);
+        validate_backup(&backup_path, 4).expect("published backup should remain valid");
+        let backup =
+            Connection::open_with_flags(&backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("published backup should reopen read-only");
+        assert_eq!(
+            backup
+                .query_row("SELECT path FROM wallpapers", [], |row| row
+                    .get::<_, String>(0))
+                .expect("backup source row should remain"),
+            "missing.jpg"
+        );
+        drop(backup);
+        remove_sqlite_files(&db_path);
     }
 
     #[test]

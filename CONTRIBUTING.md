@@ -36,7 +36,7 @@ That command launches a native app and uses PureWall's normal app-data boundary.
 2. Add a focused failing test or executable contract for the intended behavior when practical.
 3. Make the smallest implementation that closes that RED evidence without unrelated refactoring.
 4. Run focused tests, then the complete gate below.
-5. Update public documentation and `docs/project-docs/CHANGELOG_AI.md`; append to `AI_DIARY.md` only for a new reusable pitfall.
+5. Update the relevant public documentation and [CHANGELOG.md](CHANGELOG.md). For the system design, keep [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) accurate.
 
 Do not describe signing, CI, updater delivery, installer lifecycle, native smoke, or publication as complete unless that exact action ran and its evidence is available.
 
@@ -90,6 +90,7 @@ Any proposed cleanup outside that list requires an accepted ADR and explicit use
 ## Public documentation and assets
 
 - Update `README.md`, `SUPPORT.md`, `SECURITY.md`, or `ROADMAP.md` when user-visible behavior, support routing, security boundaries, or project scope changes.
+- Keep contributor-facing architecture notes in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - Keep curated public images under `design/` or `docs/images/`.
 - Keep raw generated candidates, QA captures, traces, and recordings under ignored `output/`.
 - Do not commit `.agents/`, `.codex/`, `skills-lock.json`, caches, private keys, certificate exports, release secrets, or generated signing configuration.
@@ -129,4 +130,4 @@ Real signing, updater, provenance, and release evidence comes from the tag-drive
 
 The lifecycle script requires Windows plus an explicit `-DisposableRunner` switch for any mutation, verifies Authenticode before installing, snapshots only the PureWall-owned HKCU keys and the `Run\PureWall` value, verifies the installed executable and its file version without launching it, uninstalls with `msiexec` and the exact MSI path, and stops on every non-zero msiexec exit except the documented reboot-required codes (3010, 1641). It never enumerates or deletes arbitrary directories and never writes HKLM, Windows policy, or Windows 11 context-menu-mode keys.
 
-The smoke workflow requests only `contents: read`, `id-token: write`, and `attestations: read` permissions and never publishes, edits, or deletes a release. It is executable coverage that remains **NOT RUN** until a signed draft or published release (and an optional prior version) exists; real lifecycle evidence must come from that disposable runner, never from a local `-DisposableRunner` invocation.
+The smoke workflow requests only `contents: read` and `attestations: read` permissions and never publishes, edits, or deletes a release. It is executable coverage that remains **NOT RUN** until a signed draft or published release (and an optional prior version) exists; real lifecycle evidence must come from that disposable runner, never from a local `-DisposableRunner` invocation.

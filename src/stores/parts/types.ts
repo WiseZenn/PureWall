@@ -171,9 +171,17 @@ export interface LibrarySourceMutation {
   watcher_warning: string | null;
 }
 
+export type DeleteStatus =
+  | "rejected"
+  | "not_recycled"
+  | "recycle_outcome_unknown"
+  | "recycled"
+  | "recycled_metadata_cleanup_failed";
+
 export interface DeleteResult {
   path: string;
-  deleted: boolean;
+  status: DeleteStatus;
+  code: string | null;
   message: string | null;
 }
 
@@ -220,6 +228,8 @@ export interface RatingChangedPayload {
 export interface OperationFailedPayload {
   title: string;
   message: string;
+  kind?: "source-sync";
+  source_path?: string;
 }
 
 export interface ThumbnailGeneratedPayload {

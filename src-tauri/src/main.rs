@@ -21,6 +21,7 @@ mod batch_operations;
 mod commands;
 mod context_menu;
 mod db;
+mod deletion;
 mod diagnostics;
 mod focus;
 mod image_decoder;
@@ -54,6 +55,7 @@ mod thumbnail_derivative_tests;
 mod thumbnails;
 mod tray;
 mod wallpaper;
+mod watcher_queue;
 mod widget;
 #[cfg(windows)]
 mod windows_image_decoder;
@@ -64,6 +66,7 @@ mod windows_image_decoder_tests;
 pub struct AppState {
     pub db: Mutex<db::Database>,
     pub folder_watchers: Mutex<HashMap<String, (String, scanner::FolderWatcher)>>,
+    pub watcher_queue: std::sync::Arc<watcher_queue::WatcherQueue>,
     pub source_operations: Mutex<HashSet<String>>,
     pub is_paused: Mutex<bool>,
     pub thumb_cache: thumbnails::ThumbnailCache,
@@ -147,17 +150,16 @@ struct RatingChangedPayload {
     rating: i32,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct ImportResult {
     scanned: usize,
     imported: usize,
 }
 
-#[derive(Clone, serde::Serialize)]
-pub(crate) struct DeleteResult {
-    path: String,
-    deleted: bool,
-    message: Option<String>,
+#[derive(Debug)]
+pub(crate) enum ReconciliationOutcome {
+    Applied(ImportResult),
+    SkippedStale,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -171,6 +173,35 @@ pub(crate) struct ImageMetadata {
 struct OperationFailedPayload {
     title: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+}
+
+fn operation_failed_payload(
+    title: impl Into<String>,
+    message: impl Into<String>,
+) -> OperationFailedPayload {
+    OperationFailedPayload {
+        title: title.into(),
+        message: message.into(),
+        kind: None,
+        source_path: None,
+    }
+}
+
+pub(crate) fn source_sync_failure_payload(
+    title: impl Into<String>,
+    message: impl Into<String>,
+    source_path: impl Into<String>,
+) -> OperationFailedPayload {
+    OperationFailedPayload {
+        title: title.into(),
+        message: message.into(),
+        kind: Some("source-sync".to_string()),
+        source_path: Some(source_path.into()),
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -207,6 +238,7 @@ pub(crate) struct CommandError {
 }
 
 pub(crate) type CommandResult<T> = std::result::Result<T, CommandError>;
+pub(crate) use deletion::DeleteResult;
 
 impl CommandError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
@@ -252,15 +284,9 @@ fn validate_existing_folder(path: &str) -> Result<String, String> {
     }
 
     let folder = Path::new(path);
-    scanner::ensure_local_path(folder).map_err(|e| e.to_string())?;
-    if !folder.is_dir() {
-        return Err(format!(
-            "Folder does not exist or is not a directory: {}",
-            path
-        ));
-    }
+    scanner::ensure_scan_root(folder).map_err(|e| e.to_string())?;
 
-    // Canonicalize to resolve `..`, symlinks, and other indirections (HIG-06).
+    // Canonicalize lexical aliases only after rejecting a root-level reparse boundary.
     folder
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
@@ -407,6 +433,7 @@ fn get_wallpapers_by_filter(
     }
 }
 
+#[cfg(test)]
 fn import_images_into_database(
     db: &db::Database,
     images: &[scanner::ImageInfo],
@@ -440,17 +467,9 @@ pub(crate) fn import_folder_snapshot_into_database(
     folder_path: &str,
     images: &[scanner::ImageInfo],
     source: &str,
-) -> CommandResult<ImportResult> {
-    let existing_paths = images
-        .iter()
-        .map(|image| image.path.clone())
-        .collect::<Vec<_>>();
-    db.reconcile_watched_folder_availability(folder_path, &existing_paths)
-        .map_err(CommandError::from_display)?;
-    let result = import_images_into_database(db, images, source)?;
-    db.record_watched_folder_scan_success(folder_path)
-        .map_err(CommandError::from_display)?;
-    Ok(result)
+) -> CommandResult<ReconciliationOutcome> {
+    db.reconcile_watched_paths_atomically(folder_path, source, &[], images, true)
+        .map_err(CommandError::from_display)
 }
 
 pub(crate) fn record_source_error(state: &AppState, path: &str, message: &str) {
@@ -474,19 +493,86 @@ pub(crate) fn record_source_error_for_app(app: &tauri::AppHandle, path: &str, me
     }
 }
 
+fn record_source_failure_episode(
+    db: &db::Database,
+    path: &str,
+    source: &str,
+    message: &str,
+) -> anyhow::Result<bool> {
+    let path_key = paths::path_identity_key(Path::new(path));
+    let Some(folder) = db.get_watched_folders()?.into_iter().find(|folder| {
+        folder.source == source && paths::path_identity_key(Path::new(&folder.path)) == path_key
+    }) else {
+        return Ok(false);
+    };
+    let starts_episode = folder.last_error.is_none();
+    db.record_watched_folder_error(&folder.path, message)?;
+    Ok(starts_episode)
+}
+
+fn record_source_error_if_changed(
+    app: &tauri::AppHandle,
+    path: &str,
+    source: &str,
+    message: &str,
+) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let Ok(db) = state.db.lock() else {
+        return false;
+    };
+    match record_source_failure_episode(&db, path, source, message) {
+        Ok(starts_episode) => starts_episode,
+        Err(error) => {
+            eprintln!("[PureWall] Failed to persist source error for {path}: {error}");
+            false
+        }
+    }
+}
+
 struct WatchedPathInspection {
     images: Vec<scanner::ImageInfo>,
     missing_paths: Vec<String>,
 }
 
-fn inspect_watched_paths(paths: &[PathBuf]) -> CommandResult<WatchedPathInspection> {
+fn inspect_watched_paths(
+    root: &str,
+    paths: &[watcher_queue::PathSignal],
+) -> CommandResult<WatchedPathInspection> {
+    let root_path = Path::new(root);
+    let root_key = paths::lexical_path_identity(root_path).ok_or_else(|| {
+        CommandError::new(
+            "WATCHER_RESYNC_REQUIRED",
+            "Watched root path is not safely contained.",
+        )
+    })?;
+    let canonical_root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
     let mut images = Vec::new();
     let mut missing_paths = Vec::new();
     let mut seen_images = HashSet::new();
     let mut seen_missing = HashSet::new();
 
-    for path in paths {
-        if path.is_dir() {
+    for path_signal in paths {
+        let path = &path_signal.path;
+        let event_key = paths::lexical_path_identity(path).ok_or_else(|| {
+            CommandError::new(
+                "WATCHER_RESYNC_REQUIRED",
+                "Watcher event path contains an unsafe parent component.",
+            )
+        })?;
+        if !(event_key == root_key || event_key.starts_with(&(root_key.clone() + "\\"))) {
+            continue;
+        }
+        if path.exists() {
+            let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if !paths::path_is_same_or_descendant(&resolved, &canonical_root) {
+                continue;
+            }
+        }
+        if path_signal.scan_existing_directory && path.is_dir() {
             let folder = path.to_string_lossy();
             for image in scanner::scan_folder(&folder).map_err(CommandError::from_display)? {
                 if seen_images.insert(image.path.clone()) {
@@ -497,7 +583,7 @@ fn inspect_watched_paths(paths: &[PathBuf]) -> CommandResult<WatchedPathInspecti
             if seen_images.insert(image.path.clone()) {
                 images.push(image);
             }
-        } else if !path.exists() {
+        } else if path_signal.include_missing && !path.exists() {
             let missing_path = path.to_string_lossy().to_string();
             if seen_missing.insert(missing_path.clone()) {
                 missing_paths.push(missing_path);
@@ -523,33 +609,36 @@ fn inspect_watched_paths(paths: &[PathBuf]) -> CommandResult<WatchedPathInspecti
     })
 }
 
-fn reconcile_watched_paths<F>(paths: &[PathBuf], persist: F) -> CommandResult<ImportResult>
+fn reconcile_watched_paths<T, F>(
+    source_root: &str,
+    paths: &[watcher_queue::PathSignal],
+    persist: F,
+) -> CommandResult<T>
 where
-    F: FnOnce(&WatchedPathInspection) -> CommandResult<ImportResult>,
+    F: FnOnce(&WatchedPathInspection) -> CommandResult<T>,
 {
-    let inspection = inspect_watched_paths(paths)?;
+    let inspection = inspect_watched_paths(source_root, paths)?;
     persist(&inspection)
+}
+
+fn watched_reconciliation_refresh(outcome: ReconciliationOutcome) -> Option<ImportResult> {
+    match outcome {
+        ReconciliationOutcome::Applied(summary) => Some(summary),
+        ReconciliationOutcome::SkippedStale => None,
+    }
 }
 
 fn synchronize_watched_paths(
     app: &tauri::AppHandle,
     source_root: &str,
-    paths: &[PathBuf],
+    paths: &[watcher_queue::PathSignal],
     source: &str,
+    full_snapshot: bool,
 ) {
     if app_shutdown_requested(app) {
         return;
     }
-    if app.try_state::<AppState>().is_some_and(|state| {
-        state
-            .source_operations
-            .lock()
-            .map(|operations| operations.contains(source_root))
-            .unwrap_or(false)
-    }) {
-        return;
-    }
-    let result = reconcile_watched_paths(paths, |inspection| {
+    let result = reconcile_watched_paths(source_root, paths, |inspection| {
         let state = app.try_state::<AppState>().ok_or_else(|| {
             CommandError::new(
                 "app_still_starting",
@@ -566,35 +655,44 @@ fn synchronize_watched_paths(
             .get_watched_folders()
             .map_err(CommandError::from_display)?;
         if !watched_folder_registration_is_current(&registrations, source_root, source) {
-            return Ok(ImportResult {
-                scanned: inspection.images.len(),
-                imported: 0,
-            });
+            return Ok(ReconciliationOutcome::SkippedStale);
         }
-        db.mark_paths_unavailable(&inspection.missing_paths)
-            .map_err(CommandError::from_display)?;
-        import_images_into_database(&db, &inspection.images, source)
+        db.reconcile_watched_paths_atomically(
+            source_root,
+            source,
+            &inspection.missing_paths,
+            &inspection.images,
+            full_snapshot,
+        )
+        .map_err(CommandError::from_display)
     });
 
     match result {
-        Ok(summary) => {
-            if let Err(error) = app.emit("folder-changed", summary) {
-                eprintln!("[PureWall] Failed to emit synchronized folder update: {error}");
+        Ok(outcome) => {
+            if let Some(summary) = watched_reconciliation_refresh(outcome) {
+                if let Err(error) = app.emit("folder-changed", summary) {
+                    eprintln!("[PureWall] Failed to emit synchronized folder update: {error}");
+                }
             }
         }
         Err(error) => {
+            let message = if error.code == "watcher_sync_limit_exceeded"
+                || error.code == "WATCHER_RESYNC_REQUIRED"
+            {
+                format!("WATCHER_RESYNC_REQUIRED: {}", error.message)
+            } else {
+                error.message.clone()
+            };
             eprintln!(
                 "[PureWall] Failed to synchronize watched folder paths: {}",
-                error.message
+                message
             );
-            record_source_error_for_app(app, source_root, &error.message);
-            let _ = app.emit(
-                "operation-failed",
-                OperationFailedPayload {
-                    title: "Folder update failed".to_string(),
-                    message: error.message,
-                },
-            );
+            if record_source_error_if_changed(app, source_root, source, &message) {
+                let _ = app.emit(
+                    "operation-failed",
+                    source_sync_failure_payload("Folder update failed", message, source_root),
+                );
+            }
         }
     }
 }
@@ -604,12 +702,42 @@ fn start_folder_watcher(
     folder_path: String,
     source: &str,
 ) -> anyhow::Result<scanner::FolderWatcher> {
-    let callback_app = app.clone();
-    let source = source.to_string();
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow::anyhow!("PureWall is still starting"))?;
+    let queue = state.watcher_queue.clone();
+    let callback_queue = queue.clone();
+    let watch_folder = folder_path.clone();
     let source_root = folder_path.clone();
-    scanner::start_watcher(folder_path, move |paths| {
-        synchronize_watched_paths(&callback_app, &source_root, &paths, &source);
+    let source_owner = source.to_string();
+    start_with_queue_admission(&queue, &folder_path, source, move || {
+        scanner::start_watcher(watch_folder, move |signal| {
+            if let Err(error) = callback_queue.submit(&source_root, &source_owner, signal) {
+                eprintln!("[PureWall] watcher queue rejected {source_root}: {error}");
+            }
+        })
     })
+}
+
+fn start_with_queue_admission<T, F>(
+    queue: &watcher_queue::WatcherQueue,
+    root: &str,
+    source: &str,
+    start: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T>,
+{
+    queue
+        .admit_root(root, source)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    match start() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            queue.remove_root(root, source);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -734,14 +862,19 @@ pub(crate) fn persist_and_ensure_folder_watcher(
     }
 }
 
-fn report_folder_sync_failure(app: &tauri::AppHandle, message: String) {
+fn report_folder_sync_failure(
+    app: &tauri::AppHandle,
+    source_path: &str,
+    source: &str,
+    message: String,
+) {
     eprintln!("[PureWall] Folder synchronization failed: {message}");
+    if !record_source_error_if_changed(app, source_path, source, &message) {
+        return;
+    }
     let _ = app.emit(
         "operation-failed",
-        OperationFailedPayload {
-            title: "Folder synchronization failed".to_string(),
-            message,
-        },
+        source_sync_failure_payload("Folder synchronization failed", message, source_path),
     );
 }
 
@@ -772,7 +905,7 @@ fn register_restored_folder_watcher(
 fn synchronize_persisted_folder(
     app: &tauri::AppHandle,
     folder: &db::WatchedFolderEntry,
-) -> CommandResult<ImportResult> {
+) -> CommandResult<ReconciliationOutcome> {
     let result = (|| {
         let images = scanner::scan_folder(&folder.path).map_err(CommandError::from_display)?;
         let state = app.try_state::<AppState>().ok_or_else(|| {
@@ -781,9 +914,6 @@ fn synchronize_persisted_folder(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         import_folder_snapshot_into_database(&db, &folder.path, &images, &folder.source)
     })();
-    if let Err(error) = &result {
-        record_source_error_for_app(app, &folder.path, &error.message);
-    }
     result
 }
 
@@ -826,12 +956,15 @@ fn synchronize_persisted_folders(app: tauri::AppHandle, folders: Vec<db::Watched
             break;
         }
         match synchronize_persisted_folder(&app, &folder) {
-            Ok(result) => {
+            Ok(ReconciliationOutcome::Applied(result)) => {
                 summary.scanned += result.scanned;
                 summary.imported += result.imported;
                 synchronized_any = true;
             }
-            Err(error) => report_folder_sync_failure(&app, error.message),
+            Ok(ReconciliationOutcome::SkippedStale) => {}
+            Err(error) => {
+                report_folder_sync_failure(&app, &folder.path, &folder.source, error.message)
+            }
         }
     }
     if synchronized_any && !app_shutdown_requested(&app) {
@@ -946,7 +1079,7 @@ pub(crate) fn scan_and_persist_source_snapshot(
     state: &AppState,
     path: &str,
     source: &str,
-) -> CommandResult<ImportResult> {
+) -> CommandResult<ReconciliationOutcome> {
     let images = scanner::scan_folder(path)
         .map_err(|error| source_path_error(path, error.to_string(), "SOURCE_OFFLINE"))?;
     let db = state.db.lock().map_err(|_| {
@@ -1441,10 +1574,7 @@ pub(crate) fn report_playback_failure(
     eprintln!("[PureWall] {source} {} failed: {message}", action.label());
     let _ = app.emit(
         playback_completion_events(action, false)[0],
-        OperationFailedPayload {
-            title: format!("{source}: {} failed", action.label()),
-            message,
-        },
+        operation_failed_payload(format!("{source}: {} failed", action.label()), message),
     );
 }
 
@@ -1725,6 +1855,22 @@ fn start_focus_monitor(app_handle: tauri::AppHandle) -> JoinHandle<()> {
     })
 }
 
+fn stop_watchers_before_queue<K, W, F>(watcher_registry: &Mutex<HashMap<K, W>>, close_queue: F)
+where
+    K: Eq + std::hash::Hash,
+    F: FnOnce(),
+{
+    let watchers = match watcher_registry.lock() {
+        Ok(mut watchers) => std::mem::take(&mut *watchers),
+        Err(poisoned) => {
+            let mut watchers = poisoned.into_inner();
+            std::mem::take(&mut *watchers)
+        }
+    };
+    drop(watchers);
+    close_queue();
+}
+
 pub(crate) fn shutdown_background_threads(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
@@ -1734,12 +1880,9 @@ pub(crate) fn shutdown_background_threads(app: &tauri::AppHandle) {
     state.rotation_signal.notify();
     state.focus_signal.notify();
     state.media_queue.shutdown();
-    let watchers = state
-        .folder_watchers
-        .lock()
-        .map(|mut watchers| std::mem::take(&mut *watchers))
-        .unwrap_or_default();
-    drop(watchers);
+    stop_watchers_before_queue(&state.folder_watchers, || {
+        state.watcher_queue.close_and_join()
+    });
     let handles = state
         .background_threads
         .lock()
@@ -1906,9 +2049,30 @@ fn main() {
             app.manage(Mutex::new(app_updates::PendingUpdateState::<
                 tauri_plugin_updater::Update,
             >::default()));
+            let watcher_app = app.handle().clone();
+            let watcher_queue = watcher_queue::WatcherQueue::new(move |item| {
+                let paths = if item.full_snapshot {
+                    vec![watcher_queue::PathSignal::new(
+                        PathBuf::from(&item.root),
+                        true,
+                        true,
+                    )]
+                } else {
+                    item.paths
+                };
+                synchronize_watched_paths(
+                    &watcher_app,
+                    &item.root,
+                    &paths,
+                    &item.source,
+                    item.full_snapshot,
+                );
+            });
             app.manage(AppState {
                 db: Mutex::new(db),
                 folder_watchers: Mutex::new(HashMap::new()),
+                watcher_queue,
+
                 source_operations: Mutex::new(HashSet::new()),
                 is_paused: Mutex::new(restored_playback.manual_paused),
                 thumb_cache,
@@ -2072,6 +2236,87 @@ mod main_tests {
     }
 
     #[test]
+    fn failed_watcher_start_rolls_back_queue_admission() {
+        let queue = watcher_queue::WatcherQueue::new(|_| {});
+        let result = start_with_queue_admission(&queue, r"D:\Walls", "source", || {
+            assert!(queue
+                .submit(r"d:/walls", "source", watcher_queue::Signal::NeedRescan)
+                .is_ok());
+            Err::<(), _>(anyhow::anyhow!("watch start failed"))
+        });
+
+        assert!(result.is_err());
+        assert!(queue
+            .submit(r"D:\Walls", "source", watcher_queue::Signal::NeedRescan)
+            .is_err());
+        queue.close_and_join();
+    }
+
+    #[test]
+    fn watcher_failure_episode_is_deduplicated_until_a_successful_scan() {
+        let db_path = unique_temp_db_path("watcher-failure-episode");
+        remove_sqlite_files(&db_path);
+        let db = db::Database::new(&db_path).expect("database should initialize");
+        let source_root = db_path.with_extension("watched-root");
+        let source_root = source_root.to_string_lossy().to_string();
+        db.upsert_watched_folder(&source_root, "mounted")
+            .expect("watched source should register");
+
+        assert!(record_source_failure_episode(
+            &db,
+            &source_root,
+            "mounted",
+            "first watcher failure"
+        )
+        .expect("first failure should persist"));
+        assert!(!record_source_failure_episode(
+            &db,
+            &source_root,
+            "mounted",
+            "different detail in the same unresolved episode"
+        )
+        .expect("repeated failure should persist without reopening the episode"));
+
+        let unresolved = db
+            .get_watched_folders()
+            .expect("watched source lookup should succeed")
+            .into_iter()
+            .find(|folder| folder.path == source_root)
+            .expect("watched source should remain registered");
+        assert_eq!(
+            unresolved.last_error.as_deref(),
+            Some("different detail in the same unresolved episode")
+        );
+
+        db.record_watched_folder_scan_success(&source_root)
+            .expect("successful reconciliation should clear the episode");
+        assert!(record_source_failure_episode(
+            &db,
+            &source_root,
+            "mounted",
+            "failure after recovery"
+        )
+        .expect("post-recovery failure should open a new episode"));
+
+        drop(db);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn source_sync_failure_payload_identifies_the_failed_source() {
+        let payload = serde_json::to_value(source_sync_failure_payload(
+            "Folder update failed",
+            "backend unavailable",
+            r"D:\Walls",
+        ))
+        .expect("failure payload should serialize");
+
+        assert_eq!(payload["kind"], "source-sync");
+        assert_eq!(payload["source_path"], r"D:\Walls");
+        assert_eq!(payload["message"], "backend unavailable");
+    }
+
+    #[test]
     fn import_images_into_database_returns_counts_without_loading_wallpapers() {
         let db_path = unique_temp_db_path("import-summary");
         remove_sqlite_files(&db_path);
@@ -2170,11 +2415,19 @@ mod main_tests {
             .expect("initial lookup should succeed")
             .is_none());
 
-        let result = reconcile_watched_paths(std::slice::from_ref(&image_path), |inspection| {
-            db.mark_paths_unavailable(&inspection.missing_paths)
-                .map_err(CommandError::from_display)?;
-            import_images_into_database(&db, &inspection.images, "mounted")
-        })
+        let result = reconcile_watched_paths(
+            &watched_dir.to_string_lossy(),
+            &[watcher_queue::PathSignal::new(
+                image_path.clone(),
+                false,
+                true,
+            )],
+            |inspection| {
+                db.mark_paths_unavailable(&inspection.missing_paths)
+                    .map_err(CommandError::from_display)?;
+                import_images_into_database(&db, &inspection.images, "mounted")
+            },
+        )
         .expect("watcher reconciliation should succeed");
 
         assert_eq!(result.scanned, 1);
@@ -2188,6 +2441,182 @@ mod main_tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&watched_dir);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn stale_watcher_reconciliation_skips_refresh_but_empty_applied_work_refreshes() {
+        assert!(watched_reconciliation_refresh(ReconciliationOutcome::SkippedStale).is_none());
+
+        let summary =
+            watched_reconciliation_refresh(ReconciliationOutcome::Applied(ImportResult {
+                scanned: 0,
+                imported: 0,
+            }))
+            .expect("an applied empty reconciliation still needs a refresh");
+        assert_eq!(summary.scanned, 0);
+        assert_eq!(summary.imported, 0);
+    }
+
+    #[test]
+    fn full_snapshot_helper_rejects_stale_source_without_partial_mutation() {
+        let db_path = unique_temp_db_path("snapshot-stale-source");
+        let watched_dir = db_path.with_extension("snapshot-stale-root");
+        remove_sqlite_files(&db_path);
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        std::fs::create_dir_all(&watched_dir).expect("watched root should be created");
+        let image_path = watched_dir.join("stale.jpg");
+        image::RgbImage::new(12, 8)
+            .save(&image_path)
+            .expect("test wallpaper should be saved");
+        let root = watched_dir
+            .canonicalize()
+            .expect("watched root should canonicalize")
+            .to_string_lossy()
+            .to_string();
+        let images = scanner::scan_folder(&root).expect("snapshot should scan");
+        let db = db::Database::new(&db_path).expect("database should initialize");
+        db.upsert_watched_folder(&root, "imported-folder")
+            .expect("replacement owner should register");
+        db.record_watched_folder_error(&root, "replacement remains unresolved")
+            .expect("replacement state should persist");
+
+        let outcome = import_folder_snapshot_into_database(&db, &root, &images, "mounted")
+            .expect("stale snapshot should be an authorized no-op");
+
+        assert!(matches!(outcome, ReconciliationOutcome::SkippedStale));
+        assert!(db
+            .get_wallpaper_by_path(&images[0].path)
+            .expect("wallpaper lookup should succeed")
+            .is_none());
+        let registration = db
+            .get_watched_folders()
+            .expect("watched source lookup should succeed")
+            .into_iter()
+            .find(|entry| entry.path == root)
+            .expect("replacement source should remain");
+        assert_eq!(
+            registration.last_error.as_deref(),
+            Some("replacement remains unresolved")
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn ordinary_directory_modify_does_not_scan_its_descendants() {
+        let db_path = unique_temp_db_path("watcher-ordinary-directory-modify");
+        let watched_dir = db_path.with_extension("watched-modify");
+        remove_sqlite_files(&db_path);
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        std::fs::create_dir_all(&watched_dir).expect("watched directory should be created");
+        image::RgbImage::new(12, 8)
+            .save(watched_dir.join("must-not-be-scanned.jpg"))
+            .expect("test wallpaper should be saved");
+
+        let inspection = inspect_watched_paths(
+            &watched_dir.to_string_lossy(),
+            &[watcher_queue::PathSignal::new(
+                watched_dir.clone(),
+                false,
+                false,
+            )],
+        )
+        .expect("ordinary directory metadata should be ignored safely");
+
+        assert!(inspection.images.is_empty());
+        assert!(inspection.missing_paths.is_empty());
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        remove_sqlite_files(&db_path);
+    }
+
+    #[test]
+    fn full_snapshot_marks_deleted_descendants_unavailable_and_preserves_metadata() {
+        let db_path = unique_temp_db_path("watcher-full-snapshot");
+        let watched_dir = db_path.with_extension("watched-snapshot");
+        let outside_path = db_path.with_extension("outside.jpg");
+        remove_sqlite_files(&db_path);
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        let _ = std::fs::remove_file(&outside_path);
+        std::fs::create_dir_all(&watched_dir).expect("watched directory should be created");
+        let retained_path = watched_dir.join("retained.jpg");
+        let deleted_path = watched_dir.join("deleted.jpg");
+        for path in [&retained_path, &deleted_path, &outside_path] {
+            image::RgbImage::new(12, 8)
+                .save(path)
+                .expect("test wallpaper should be saved");
+        }
+        let watched_root = watched_dir
+            .canonicalize()
+            .expect("root should canonicalize");
+        let retained = retained_path
+            .canonicalize()
+            .expect("retained path should canonicalize")
+            .to_string_lossy()
+            .to_string();
+        let deleted = deleted_path
+            .canonicalize()
+            .expect("deleted path should canonicalize")
+            .to_string_lossy()
+            .to_string();
+        let outside = outside_path
+            .canonicalize()
+            .expect("outside path should canonicalize")
+            .to_string_lossy()
+            .to_string();
+        let db = db::Database::new(&db_path).expect("database should initialize");
+        db.upsert_watched_folder(&watched_root.to_string_lossy(), "mounted")
+            .expect("watched root should register");
+        for path in [&retained, &deleted, &outside] {
+            db.upsert_wallpaper(path, "hash", "mounted", 12, 8, 10)
+                .expect("wallpaper should register");
+        }
+        db.set_rating(&deleted, 1).expect("rating should persist");
+        let tag = db
+            .create_tag("Snapshot", db::DEFAULT_TAG_COLOR)
+            .expect("tag should be created");
+        db.assign_tag(&deleted, tag.id)
+            .expect("tag should be assigned");
+        let collection = db
+            .create_collection("Snapshot", db::DEFAULT_TAG_COLOR)
+            .expect("collection should be created");
+        db.assign_collection(&deleted, collection.id)
+            .expect("collection should be assigned");
+
+        std::fs::remove_file(&deleted_path).expect("descendant should be deleted");
+        let images = scanner::scan_folder(&watched_root.to_string_lossy())
+            .expect("remaining snapshot should scan");
+        db.reconcile_watched_paths_atomically(
+            &watched_root.to_string_lossy(),
+            "mounted",
+            std::slice::from_ref(&outside),
+            &images,
+            true,
+        )
+        .expect("full snapshot should reconcile");
+
+        let deleted_entry = db
+            .get_wallpaper_by_path(&deleted)
+            .expect("deleted metadata lookup should succeed")
+            .expect("deleted metadata should be retained");
+        assert_eq!(deleted_entry.rating, 1);
+        assert_eq!(deleted_entry.tags.len(), 1);
+        assert!(db
+            .registered_available_paths(std::slice::from_ref(&deleted))
+            .expect("availability lookup should succeed")
+            .is_empty());
+        let available = db
+            .registered_available_paths(&[retained.clone(), outside.clone()])
+            .expect("remaining availability lookup should succeed");
+        assert!(available.contains(&retained));
+        assert!(available.contains(&outside));
+        assert_eq!(db.get_collections().unwrap()[0].wallpaper_count, 0);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&watched_dir);
+        let _ = std::fs::remove_file(&outside_path);
         remove_sqlite_files(&db_path);
     }
 
@@ -2212,9 +2641,15 @@ mod main_tests {
             .to_string();
         let db = db::Database::new(&db_path).expect("database should initialize");
 
-        reconcile_watched_paths(std::slice::from_ref(&image_path), |inspection| {
-            import_images_into_database(&db, &inspection.images, "mounted")
-        })
+        reconcile_watched_paths(
+            &watched_root.to_string_lossy(),
+            &[watcher_queue::PathSignal::new(
+                image_path.clone(),
+                false,
+                true,
+            )],
+            |inspection| import_images_into_database(&db, &inspection.images, "mounted"),
+        )
         .expect("initial watcher reconciliation should succeed");
         assert_eq!(
             db.get_wallpapers_page("all", "created", "", 0, 10)
@@ -2224,11 +2659,19 @@ mod main_tests {
         );
 
         std::fs::remove_dir_all(&watched_dir).expect("watched directory should be removed");
-        let result = reconcile_watched_paths(std::slice::from_ref(&watched_root), |inspection| {
-            db.mark_paths_unavailable(&inspection.missing_paths)
-                .map_err(CommandError::from_display)?;
-            import_images_into_database(&db, &inspection.images, "mounted")
-        })
+        let result = reconcile_watched_paths(
+            &watched_root.to_string_lossy(),
+            &[watcher_queue::PathSignal::new(
+                watched_root.clone(),
+                true,
+                true,
+            )],
+            |inspection| {
+                db.mark_paths_unavailable(&inspection.missing_paths)
+                    .map_err(CommandError::from_display)?;
+                import_images_into_database(&db, &inspection.images, "mounted")
+            },
+        )
         .expect("removed directory reconciliation should succeed");
 
         assert_eq!(result.scanned, 0);
@@ -2296,6 +2739,33 @@ mod main_tests {
         assert_eq!(watchers["root-a"].0, "mounted");
         drop(watchers);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn shutdown_drops_native_watchers_before_closing_the_reconciliation_queue() {
+        use std::sync::{Arc, Mutex};
+
+        struct FakeWatcher(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for FakeWatcher {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("watcher");
+            }
+        }
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let registry = Mutex::new(HashMap::from([(
+            "root".to_string(),
+            FakeWatcher(Arc::clone(&order)),
+        )]));
+
+        stop_watchers_before_queue(&registry, {
+            let order = Arc::clone(&order);
+            move || order.lock().unwrap().push("queue")
+        });
+
+        assert_eq!(*order.lock().unwrap(), vec!["watcher", "queue"]);
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[test]

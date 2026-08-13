@@ -398,6 +398,45 @@ describe("wallpaper Store command routing", () => {
     expect(listenMock.mock.calls.map(([eventName]) => eventName)).not.toContain("tray-dislike");
   });
 
+  it("refreshes library sources when a source sync failure event arrives", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "list_library_sources") {
+        return [
+          {
+            path: "D:\\Walls",
+            source: "mounted",
+            status: "offline",
+            available_count: 0,
+            unavailable_count: 1,
+            last_scan_at: null,
+            last_error: "backend unavailable",
+          },
+        ];
+      }
+      return undefined;
+    });
+    const store = useWallpaperStore();
+    await store.setupListeners();
+    invokeMock.mockClear();
+
+    await listenerHandlers.get("operation-failed")?.({
+      payload: {
+        title: "Folder update failed",
+        message: "backend unavailable",
+        kind: "source-sync",
+        source_path: "D:\\Walls",
+      },
+    });
+    await flush();
+
+    expect(invokeMock).toHaveBeenCalledWith("list_library_sources");
+    expect(store.librarySources[0]).toMatchObject({
+      path: "D:\\Walls",
+      status: "offline",
+      last_error: "backend unavailable",
+    });
+  });
+
   it("keeps path-targeted gallery and inspector ratings on their legacy commands", async () => {
     const store = useWallpaperStore();
     const path = "D:/walls/selected.jpg";

@@ -138,30 +138,71 @@ export async function deleteWallpaper(path: string, ctx: TaxonomyStateContext) {
   });
 }
 
-async function commitPendingDelete(
+export async function reconcileDeleteResults(
+  results: DeleteResult[],
+  snapshots: WallpaperSnapshot[],
+  ctx: TaxonomyStateContext,
+) {
+  const notRecycled = new Set(
+    results
+      .filter((result) => result.status === "rejected" || result.status === "not_recycled")
+      .map((result) => result.path),
+  );
+  if (notRecycled.size > 0) {
+    ctx.restoreSnapshots(snapshots.filter((snapshot) => notRecycled.has(snapshot.wallpaper.path)));
+    ctx.notify("Some wallpapers were not deleted", `${notRecycled.size} items stayed in your library.`, "error");
+  }
+
+  const unknown = results.filter((result) => result.status === "recycle_outcome_unknown");
+  if (unknown.length > 0) {
+    ctx.notify(
+      "Recycle Bin outcome needs attention",
+      unknown[0].message ?? `${unknown.length} wallpaper deletion outcome(s) could not be confirmed.`,
+      "error",
+    );
+  }
+
+  const cleanupFailures = results.filter(
+    (result) => result.status === "recycled_metadata_cleanup_failed",
+  );
+  if (cleanupFailures.length > 0) {
+    ctx.notify(
+      "Deletion metadata cleanup warning",
+      cleanupFailures[0].message ?? "Some recycled wallpapers still have local metadata.",
+      "error",
+    );
+  }
+
+  // Reconcile every view after any structured result. Recycled items remain removed;
+  // only known-not-recycled outcomes restore their optimistic snapshots above.
+  await Promise.all([ctx.loadWallpapers(), ctx.loadStats(), ctx.loadCollections()]);
+}
+
+export async function commitPendingDelete(
   paths: string[],
   snapshots: WallpaperSnapshot[],
   ctx: TaxonomyStateContext,
 ) {
+  let results: DeleteResult[];
   try {
-    if (paths.length === 1) {
-      await invoke("delete_wallpaper", { path: paths[0] });
-    } else {
-      const results = await invoke<DeleteResult[]>("batch_delete_wallpapers", { paths });
-      const failedPaths = new Set(results.filter((result) => !result.deleted).map((result) => result.path));
-      if (failedPaths.size > 0) {
-        ctx.restoreSnapshots(snapshots.filter((snapshot) => failedPaths.has(snapshot.wallpaper.path)));
-        ctx.notify("Some wallpapers were not deleted", `${failedPaths.size} items stayed in your library.`, "error");
-      }
-      const dbCleanupWarnings = results.filter((result) => result.deleted && result.message);
-      if (dbCleanupWarnings.length > 0) {
-        ctx.notify("Deletion cleanup warning", dbCleanupWarnings[0].message ?? "Some deleted items may need cleanup on the next scan.", "error");
-      }
-    }
-    await ctx.loadStats();
+    results = paths.length === 1
+      ? [await invoke<DeleteResult>("delete_wallpaper", { path: paths[0] })]
+      : await invoke<DeleteResult[]>("batch_delete_wallpapers", { paths });
   } catch (e) {
+    // The backend guarantees that an invocation error before a structured result
+    // means no Recycle Bin call began, so restoring all optimistic snapshots is safe.
     ctx.restoreSnapshots(snapshots);
     ctx.reportFailure("Failed to delete wallpaper", e);
+    return;
+  }
+
+  try {
+    await reconcileDeleteResults(results, snapshots, ctx);
+  } catch (e) {
+    // A structured result crosses the post-effect boundary. Reconciliation has
+    // already restored only known-not-recycled items; never restore all snapshots
+    // after a refresh failure because confirmed/unknown Shell effects may exist.
+    ctx.reportFailure("Deletion completed, but library refresh failed", e);
   }
 }
 

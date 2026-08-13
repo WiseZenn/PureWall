@@ -16,7 +16,7 @@ withDefaults(
   },
 );
 
-defineEmits<{
+const emit = defineEmits<{
   click: [event: MouseEvent];
 }>();
 </script>
@@ -29,6 +29,7 @@ defineEmits<{
     :aria-label="label"
     :aria-pressed="active ? 'true' : undefined"
     :title="label"
+    @click="emit('click', $event)"
   >
     <AppIcon :name="icon" />
   </button>

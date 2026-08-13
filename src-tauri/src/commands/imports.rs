@@ -1,8 +1,9 @@
 use crate::{
-    import_folder_snapshot_into_database, persist_and_ensure_folder_watcher, record_source_error,
-    record_source_error_for_app, scan_and_persist_source_snapshot, scanner,
-    spawn_tracked_background, validate_existing_image_file, validate_source_folder, AppState,
-    CommandError, CommandResult, ImportResult, OperationFailedPayload,
+    import_folder_snapshot_into_database, operation_failed_payload,
+    persist_and_ensure_folder_watcher, record_source_error, record_source_error_for_app,
+    scan_and_persist_source_snapshot, scanner, spawn_tracked_background,
+    validate_existing_image_file, validate_source_folder, AppState, CommandError, CommandResult,
+    ImportResult, ReconciliationOutcome,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -25,10 +26,17 @@ pub(crate) fn set_wallpaper_folder(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         import_folder_snapshot_into_database(&db, &path, &images, "mounted")
     })();
-    if let Err(error) = &result {
-        record_source_error(&state, &path, &error.message);
+    match result {
+        Ok(ReconciliationOutcome::Applied(summary)) => Ok(summary),
+        Ok(ReconciliationOutcome::SkippedStale) => Err(CommandError::new(
+            "SOURCE_STALE",
+            "The library source changed before its folder scan could be saved.",
+        )),
+        Err(error) => {
+            record_source_error(&state, &path, &error.message);
+            Err(error)
+        }
     }
-    result
 }
 
 #[tauri::command]
@@ -54,8 +62,17 @@ pub(crate) fn import_wallpaper_folder(
             });
 
         match result {
-            Ok(summary) => {
+            Ok(ReconciliationOutcome::Applied(summary)) => {
                 let _ = app.emit("import-complete", summary);
+            }
+            Ok(ReconciliationOutcome::SkippedStale) => {
+                let _ = app.emit(
+                    "import-complete",
+                    ImportResult {
+                        scanned: 0,
+                        imported: 0,
+                    },
+                );
             }
             Err(error) => {
                 record_source_error_for_app(&app, &import_path, &error.message);
@@ -65,10 +82,7 @@ pub(crate) fn import_wallpaper_folder(
                 );
                 let _ = app.emit(
                     "operation-failed",
-                    OperationFailedPayload {
-                        title: "Import failed".to_string(),
-                        message: error.message,
-                    },
+                    operation_failed_payload("Import failed", error.message),
                 );
                 let _ = app.emit(
                     "import-complete",

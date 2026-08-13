@@ -50,6 +50,12 @@ function onCardClick(event: MouseEvent) {
 }
 
 function onCardKeyboardActivate(event: KeyboardEvent) {
+  // Only activate the card when the key event originated on the card itself.
+  // Nested buttons (select, retry, rating, actions) handle their own keys; a
+  // bubbling Enter/Space from them must not also activate the card.
+  if (event.target !== event.currentTarget) {
+    return;
+  }
   if (store.selectionMode) {
     store.toggleSelection(props.wallpaper.path);
     return;

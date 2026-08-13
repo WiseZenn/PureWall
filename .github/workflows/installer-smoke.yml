@@ -25,62 +25,102 @@ jobs:
   lifecycle-smoke:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - run: npm ci
 
+      - name: Validate release tags
+        shell: pwsh
+        env:
+          INPUT_CURRENT_TAG: ${{ inputs.currentTag }}
+          INPUT_PREVIOUS_TAG: ${{ inputs.previousTag }}
+        run: |
+          $current = $env:INPUT_CURRENT_TAG
+          if ($current -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "currentTag must be a strict v<major>.<minor>.<patch> tag, got: $current"
+          }
+          if ($env:INPUT_PREVIOUS_TAG) {
+            $previous = $env:INPUT_PREVIOUS_TAG
+            if ($previous -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw "previousTag must be a strict v<major>.<minor>.<patch> tag, got: $previous"
+            }
+          }
+          Write-Host "Tags validated: current=$current previous=$($env:INPUT_PREVIOUS_TAG)"
+
       - name: Download current MSI and checksums
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_CURRENT_TAG: ${{ inputs.currentTag }}
         run: |
           $currentDir = Join-Path $env:RUNNER_TEMP 'smoke-current'
           New-Item -ItemType Directory -Path $currentDir -Force | Out-Null
-          gh release download "${{ inputs.currentTag }}" --repo WiseZenn/PureWall --dir $currentDir --pattern "*.msi" --pattern "SHA256SUMS.txt"
+          gh release download "$env:INPUT_CURRENT_TAG" --repo WiseZenn/PureWall --dir $currentDir --pattern "*.msi" --pattern "SHA256SUMS.txt"
           $msiCount = @(Get-ChildItem -Path $currentDir -Filter *.msi).Count
-          if ($msiCount -ne 1) { throw "Expected exactly one MSI from tag ${{ inputs.currentTag }}, found $msiCount" }
+          if ($msiCount -ne 1) { throw "Expected exactly one MSI from tag $($env:INPUT_CURRENT_TAG), found $msiCount" }
 
       - name: Verify SHA256SUMS.txt and GitHub attestation for current MSI
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_CURRENT_TAG: ${{ inputs.currentTag }}
         run: |
           $currentDir = Join-Path $env:RUNNER_TEMP 'smoke-current'
           $sumsPath = Join-Path $currentDir 'SHA256SUMS.txt'
-          if (-not (Test-Path -LiteralPath $sumsPath)) { throw "SHA256SUMS.txt not found for tag ${{ inputs.currentTag }}" }
-          $sums = Get-Content -LiteralPath $sumsPath
+          if (-not (Test-Path -LiteralPath $sumsPath)) { throw "SHA256SUMS.txt not found for tag $($env:INPUT_CURRENT_TAG)" }
           $msi = Get-ChildItem -Path $currentDir -Filter *.msi | Select-Object -First 1
           $hash = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          $expectedLine = $sums | Where-Object { $_ -match [regex]::Escape($msi.Name) }
+          $expectedLine = Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match [regex]::Escape($msi.Name) }
           if (-not $expectedLine) { throw "No SHA256SUMS.txt line found for $($msi.Name)" }
           if ($expectedLine -notmatch $hash) { throw "SHA256 checksum mismatch for $($msi.Name)" }
           Write-Host "SHA256 verified: $($msi.Name)"
           gh attestation verify $msi.FullName --repo WiseZenn/PureWall
 
-      - name: Download previous MSI when supplied
+      - name: Download previous MSI and checksums when supplied
+        if: inputs.previousTag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PREVIOUS_TAG: ${{ inputs.previousTag }}
+        run: |
+          $previousDir = Join-Path $env:RUNNER_TEMP 'smoke-previous'
+          New-Item -ItemType Directory -Path $previousDir -Force | Out-Null
+          gh release download "$env:INPUT_PREVIOUS_TAG" --repo WiseZenn/PureWall --dir $previousDir --pattern "*.msi" --pattern "SHA256SUMS.txt"
+          $msiCount = @(Get-ChildItem -Path $previousDir -Filter *.msi).Count
+          if ($msiCount -ne 1) { throw "Expected exactly one MSI from tag $($env:INPUT_PREVIOUS_TAG), found $msiCount" }
+
+      - name: Verify SHA256SUMS.txt and GitHub attestation for previous MSI
         if: inputs.previousTag != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $previousDir = Join-Path $env:RUNNER_TEMP 'smoke-previous'
-          New-Item -ItemType Directory -Path $previousDir -Force | Out-Null
-          gh release download "${{ inputs.previousTag }}" --repo WiseZenn/PureWall --dir $previousDir --pattern "*.msi"
-          $msiCount = @(Get-ChildItem -Path $previousDir -Filter *.msi).Count
-          if ($msiCount -ne 1) { throw "Expected exactly one MSI from tag ${{ inputs.previousTag }}, found $msiCount" }
+          $sumsPath = Join-Path $previousDir 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $sumsPath)) { throw "SHA256SUMS.txt not found for previous tag" }
+          $msi = Get-ChildItem -Path $previousDir -Filter *.msi | Select-Object -First 1
+          $hash = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedLine = Get-Content -LiteralPath $sumsPath | Where-Object { $_ -match [regex]::Escape($msi.Name) }
+          if (-not $expectedLine) { throw "No SHA256SUMS.txt line found for $($msi.Name)" }
+          if ($expectedLine -notmatch $hash) { throw "SHA256 checksum mismatch for $($msi.Name)" }
+          Write-Host "SHA256 verified (previous): $($msi.Name)"
+          gh attestation verify $msi.FullName --repo WiseZenn/PureWall
 
       - name: Run installer lifecycle smoke on the disposable runner
         shell: pwsh
+        env:
+          INPUT_CURRENT_TAG: ${{ inputs.currentTag }}
+          INPUT_PREVIOUS_TAG: ${{ inputs.previousTag }}
         run: |
           $currentDir = Join-Path $env:RUNNER_TEMP 'smoke-current'
           $currentMsi = (Get-ChildItem -Path $currentDir -Filter *.msi | Select-Object -First 1).FullName
           $scriptArgs = @('-CurrentMsi', $currentMsi, '-DisposableRunner')
-          if ("${{ inputs.previousTag }}" -ne '') {
+          if ($env:INPUT_PREVIOUS_TAG -ne '') {
             $previousDir = Join-Path $env:RUNNER_TEMP 'smoke-previous'
             $previousMsi = (Get-ChildItem -Path $previousDir -Filter *.msi | Select-Object -First 1).FullName
             $scriptArgs += @('-PreviousMsi', $previousMsi)

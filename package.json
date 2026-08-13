@@ -11,8 +11,9 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run --exclude scripts/qa-screenshots.test.mjs",
     "test:release-contract": "node scripts/verify-release-contract.mjs --self-test",
+    "qa:screenshots": "npm run build && node scripts/qa-screenshots.mjs && node --test scripts/qa-screenshots.test.mjs",
     "verify:release": "node scripts/verify-release-contract.mjs"
   },
   "dependencies": {

@@ -32,12 +32,79 @@ pub(crate) fn path_identity_key(path: &Path) -> String {
 
 #[cfg(windows)]
 pub(crate) fn path_is_same_or_descendant(candidate: &Path, root: &Path) -> bool {
-    let candidate = path_identity_key(candidate);
-    let root = path_identity_key(root);
-    candidate == root
-        || candidate
-            .strip_prefix(&root)
-            .is_some_and(|suffix| suffix.starts_with('\\'))
+    lexical_path_identity(candidate)
+        .zip(lexical_path_identity(root))
+        .is_some_and(|(candidate, root)| {
+            candidate == root
+                || candidate
+                    .strip_prefix(&root)
+                    .is_some_and(|suffix| suffix.starts_with('\\'))
+        })
+}
+
+/// Component-aware, no-IO containment for untrusted filesystem event paths.
+/// ParentDir is rejected rather than resolved so lexical escapes fail closed.
+#[cfg(windows)]
+pub(crate) fn lexical_path_identity(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    let raw = path.to_string_lossy().replace('/', "\\");
+    let raw = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw
+    };
+    let mut output = String::new();
+    let mut rooted = false;
+    for component in Path::new(&raw).components() {
+        match component {
+            Component::Prefix(prefix) => {
+                rooted = true;
+                output.push_str(&prefix.as_os_str().to_string_lossy().to_lowercase());
+                if matches!(prefix.kind(), Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _)) {
+                    output.push('\\');
+                }
+            }
+            Component::RootDir => {
+                rooted = true;
+                if !output.ends_with('\\') {
+                    output.push('\\');
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Normal(value) => {
+                if !output.is_empty() && !output.ends_with('\\') {
+                    output.push('\\');
+                }
+                output.push_str(&value.to_string_lossy().to_lowercase());
+            }
+        }
+    }
+    if !rooted {
+        return None;
+    }
+    while output.ends_with('\\') && output.len() > 1 {
+        output.pop();
+    }
+    Some(output)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn lexical_path_identity(path: &Path) -> Option<String> {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 #[cfg(not(windows))]

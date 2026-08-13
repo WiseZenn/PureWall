@@ -243,6 +243,15 @@ function Assert-DisposableRunnerGuard {
   if (-not $DisposableRunner) {
     throw 'Refusing to mutate this machine: pass -DisposableRunner, which is reserved for GitHub-hosted disposable Windows runners'
   }
+  # A switch alone is not proof of a disposable environment: a maintainer can pass
+  # it locally by mistake. Require the GitHub Actions hosted-runner markers so this
+  # script can never install/uninstall an MSI on a workstation.
+  if ($env:GITHUB_ACTIONS -ne 'true') {
+    throw 'Refusing to mutate: -DisposableRunner requires GITHUB_ACTIONS=true (GitHub-hosted runner)'
+  }
+  if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or -not (Test-Path -LiteralPath $env:RUNNER_TEMP)) {
+    throw 'Refusing to mutate: RUNNER_TEMP must point at an existing runner temp directory'
+  }
 }
 
 function Assert-MsiAllowed {

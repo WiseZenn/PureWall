@@ -38,6 +38,6 @@ Safety details or exceptions:
 ## Documentation and repository artifacts
 
 - [ ] User-facing behavior is reflected in `README.md`, `SUPPORT.md`, `SECURITY.md`, or other public documentation as needed.
-- [ ] `docs/project-docs/CHANGELOG_AI.md` records implementation and verification evidence.
-- [ ] A new reusable pitfall was appended to `docs/project-docs/AI_DIARY.md`, or no new pitfall was found.
+- [ ] Architecture-impacting changes are reflected in `docs/ARCHITECTURE.md` when applicable.
+- [ ] Contributor-relevant workflow or safety-boundary changes are reflected in `docs/ARCHITECTURE.md` when applicable.
 - [ ] New public images are curated under `design/` or `docs/images/`; raw QA/generated output and signing material are not committed.

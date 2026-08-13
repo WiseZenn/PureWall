@@ -33,8 +33,16 @@ onMounted(async () => {
 async function setRotationInterval(value: string | number) {
   const seconds = Number(value);
   if (!seconds) return;
+  const previous = currentInterval.value;
   currentInterval.value = seconds;
-  await invoke("set_rotation_interval", { seconds });
+  try {
+    await invoke("set_rotation_interval", { seconds });
+  } catch (error) {
+    // The backend rejected the value: restore the last known-good interval so
+    // the UI never displays a setting the Rust side refused.
+    currentInterval.value = previous;
+    console.warn("[PureWall] Failed to set rotation interval:", error);
+  }
 }
 
 </script>

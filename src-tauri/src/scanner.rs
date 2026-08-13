@@ -1,10 +1,7 @@
+use crate::watcher_queue::{PathSignal, Signal};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::path::{Component, Path, Prefix};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageInfo {
@@ -19,38 +16,71 @@ const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "bmp", "webp"];
 pub const MAX_SCAN_DEPTH: usize = 24;
 pub const MAX_SCAN_IMAGES: usize = 20_000;
 pub const MAX_SCAN_ENTRIES: usize = 100_000;
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
-
-enum WatcherMessage {
-    Changed(Vec<PathBuf>),
-    Stop,
-}
 
 pub struct FolderWatcher {
     _watcher: notify::RecommendedWatcher,
-    tx: Sender<WatcherMessage>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl Drop for FolderWatcher {
-    fn drop(&mut self) {
-        let _ = self.tx.send(WatcherMessage::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 /// Recursively scan a folder for image files
 pub fn scan_folder(folder_path: &str) -> Result<Vec<ImageInfo>> {
-    let root = Path::new(folder_path);
-    ensure_local_path(root)?;
-    if !root.is_dir() {
+    scan_folder_with_root_inspection(folder_path, inspect_scan_root)
+}
+
+struct ScanRootMetadata {
+    is_directory: bool,
+    is_symlink: bool,
+    is_reparse_point: bool,
+}
+
+fn inspect_scan_root(path: &Path) -> Result<ScanRootMetadata> {
+    let metadata = std::fs::symlink_metadata(path).context("Failed to inspect folder")?;
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        windows_attributes_are_reparse_point(metadata.file_attributes())
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+
+    Ok(ScanRootMetadata {
+        is_directory: metadata.is_dir(),
+        is_symlink: metadata.file_type().is_symlink(),
+        is_reparse_point,
+    })
+}
+
+pub(crate) fn ensure_scan_root(path: &Path) -> Result<()> {
+    ensure_local_path(path)?;
+    validate_scan_root_metadata(path, inspect_scan_root(path)?)
+}
+
+fn validate_scan_root_metadata(path: &Path, metadata: ScanRootMetadata) -> Result<()> {
+    if metadata.is_symlink || metadata.is_reparse_point {
         anyhow::bail!(
-            "Folder does not exist or is not a directory: {}",
-            folder_path
+            "Folder root cannot be a symbolic link or reparse point: {}",
+            path.display()
         );
     }
+    if !metadata.is_directory {
+        anyhow::bail!(
+            "Folder does not exist or is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn scan_folder_with_root_inspection<F>(folder_path: &str, inspect_root: F) -> Result<Vec<ImageInfo>>
+where
+    F: FnOnce(&Path) -> Result<ScanRootMetadata>,
+{
+    let root = Path::new(folder_path);
+    ensure_local_path(root)?;
+    validate_scan_root_metadata(root, inspect_root(root)?)?;
 
     let mut images = Vec::new();
     let mut budget = ScanBudget::default();
@@ -120,7 +150,7 @@ fn collect_images(
             let file_type = entry
                 .file_type()
                 .context("Failed to inspect directory entry type")?;
-            if file_type.is_symlink() {
+            if file_type.is_symlink() || entry_is_reparse_point(&entry)? {
                 continue;
             }
 
@@ -152,21 +182,33 @@ fn collect_images(
     Ok(())
 }
 
+#[cfg(windows)]
+fn entry_is_reparse_point(entry: &std::fs::DirEntry) -> Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(entry.path())
+        .context("Failed to inspect directory entry attributes")?;
+    Ok(windows_attributes_are_reparse_point(
+        metadata.file_attributes(),
+    ))
+}
+
+#[cfg(not(windows))]
+fn entry_is_reparse_point(_entry: &std::fs::DirEntry) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 pub(crate) fn is_supported_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| SUPPORTED_EXTENSIONS.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
-}
-
-fn watcher_path_is_relevant(
-    path: &Path,
-    include_existing_directories: bool,
-    include_missing_paths: bool,
-) -> bool {
-    is_supported_image(path)
-        || (include_existing_directories && path.is_dir())
-        || (include_missing_paths && !path.exists())
 }
 
 pub(crate) fn ensure_local_path(path: &Path) -> Result<()> {
@@ -281,37 +323,39 @@ pub(crate) fn stable_fingerprint(input: &str) -> u128 {
     hash
 }
 
-fn run_watcher_events<F>(rx: Receiver<WatcherMessage>, debounce: Duration, on_change: F)
-where
-    F: Fn(Vec<PathBuf>),
-{
-    let mut pending = BTreeSet::new();
+fn classify_watcher_event(event: notify::Event) -> Vec<Signal> {
+    use notify::event::ModifyKind;
+    use notify::EventKind;
 
-    while let Ok(WatcherMessage::Changed(paths)) = rx.recv() {
-        pending.extend(paths);
-
-        loop {
-            match rx.recv_timeout(debounce) {
-                Ok(WatcherMessage::Changed(paths)) => pending.extend(paths),
-                Ok(WatcherMessage::Stop) => return,
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
-
-        if !pending.is_empty() {
-            on_change(std::mem::take(&mut pending).into_iter().collect());
-        }
+    if event.need_rescan() {
+        return vec![Signal::NeedRescan];
     }
+
+    let (scan_existing_directory, include_missing) = match event.kind {
+        EventKind::Access(_) => return Vec::new(),
+        EventKind::Create(_) => (true, false),
+        EventKind::Remove(_) => (false, true),
+        EventKind::Modify(ModifyKind::Name(_)) => (true, true),
+        EventKind::Modify(_) | EventKind::Any | EventKind::Other => (false, false),
+    };
+    if event.paths.is_empty() {
+        return Vec::new();
+    }
+    vec![Signal::Paths(
+        event
+            .paths
+            .into_iter()
+            .map(|path| PathSignal::new(path, scan_existing_directory, include_missing))
+            .collect(),
+    )]
 }
 
 /// Start watching a folder and deliver de-duplicated change batches after a short quiet period.
-pub fn start_watcher<F>(folder_path: String, on_change: F) -> Result<FolderWatcher>
+pub fn start_watcher<F>(folder_path: String, on_signal: F) -> Result<FolderWatcher>
 where
-    F: Fn(Vec<PathBuf>) + Send + 'static,
+    F: Fn(Signal) + Send + Sync + 'static,
 {
-    use notify::{event::ModifyKind, recommended_watcher, EventKind, RecursiveMode, Watcher};
-
+    use notify::{recommended_watcher, RecursiveMode, Watcher};
     let folder = Path::new(&folder_path);
     ensure_local_path(folder)?;
     if !folder.is_dir() {
@@ -320,57 +364,27 @@ where
             folder_path
         );
     }
-
-    let (tx, rx) = channel();
-
-    let event_tx = tx.clone();
-    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            let include_existing_directories = matches!(
-                &event.kind,
-                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
-            );
-            let include_missing_paths = matches!(
-                &event.kind,
-                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-            );
-            let paths = event
-                .paths
-                .into_iter()
-                .filter(|path| {
-                    watcher_path_is_relevant(
-                        path,
-                        include_existing_directories,
-                        include_missing_paths,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if !paths.is_empty() {
-                let _ = event_tx.send(WatcherMessage::Changed(paths));
+    let mut watcher = recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(event) => {
+            for signal in classify_watcher_event(event) {
+                on_signal(signal);
             }
         }
+        Err(error) => on_signal(Signal::NotifyError(error.to_string())),
     })
     .context("Failed to create file watcher")?;
-
     watcher
         .watch(folder, RecursiveMode::Recursive)
         .context("Failed to start watching folder")?;
-
-    let thread = std::thread::spawn(move || {
-        run_watcher_events(rx, WATCH_DEBOUNCE, on_change);
-    });
-
-    Ok(FolderWatcher {
-        _watcher: watcher,
-        tx,
-        thread: Some(thread),
-    })
+    Ok(FolderWatcher { _watcher: watcher })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+    use notify::{Event, EventKind};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn scan_files_rejects_too_many_paths_before_touching_disk() {
@@ -387,6 +401,50 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_reparse_point_attribute_is_always_excluded_from_traversal() {
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+        assert!(!windows_attributes_are_reparse_point(0));
+        assert!(!windows_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(windows_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scan_folder_entry_rejects_a_root_with_reparse_attributes() {
+        let root = std::env::temp_dir().join(format!(
+            "purewall-root-reparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("ordinary test root should be created");
+
+        let error = scan_folder_with_root_inspection(&root.to_string_lossy(), |_| {
+            Ok(ScanRootMetadata {
+                is_directory: true,
+                is_symlink: false,
+                is_reparse_point: true,
+            })
+        })
+        .expect_err("a reparse-backed root must be rejected before traversal");
+
+        assert!(
+            error.to_string().contains("reparse point"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn ensure_local_path_rejects_unc_paths() {
         let err = ensure_local_path(Path::new(r"\\server\share\wallpaper.jpg"))
             .expect_err("UNC paths must be rejected");
@@ -397,48 +455,63 @@ mod tests {
     }
 
     #[test]
-    fn watcher_events_are_debounced_and_deduplicated() {
-        let (tx, rx) = channel();
-        let (batch_tx, batch_rx) = channel();
-        let thread = std::thread::spawn(move || {
-            run_watcher_events(rx, Duration::from_millis(10), move |paths| {
-                batch_tx
-                    .send(paths)
-                    .expect("test batch receiver should stay connected");
-            });
-        });
-        let first = PathBuf::from(r"C:\purewall-test\a.jpg");
-        let second = PathBuf::from(r"C:\purewall-test\b.jpg");
-
-        tx.send(WatcherMessage::Changed(vec![second.clone(), first.clone()]))
-            .expect("first watcher event should send");
-        tx.send(WatcherMessage::Changed(vec![first.clone()]))
-            .expect("duplicate watcher event should send");
-
-        let batch = batch_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("one debounced batch should arrive");
-        assert_eq!(batch, vec![first, second]);
-
-        tx.send(WatcherMessage::Stop)
-            .expect("watcher stop should send");
-        thread.join().expect("watcher event thread should stop");
+    fn modify_data_and_metadata_events_never_request_directory_scans() {
+        for kind in [
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+        ] {
+            let path = PathBuf::from("ordinary-directory");
+            let signals = classify_watcher_event(Event::new(kind).add_path(path.clone()));
+            assert_eq!(signals.len(), 1);
+            let Signal::Paths(paths) = &signals[0] else {
+                panic!("ordinary modify should stay incremental");
+            };
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].path, path);
+            assert!(!paths[0].scan_existing_directory);
+            assert!(!paths[0].include_missing);
+        }
     }
 
     #[test]
-    fn ordinary_directory_changes_do_not_trigger_subtree_scans() {
-        let directory = Path::new(".");
-        assert!(directory.is_dir());
-        assert!(!watcher_path_is_relevant(directory, false, false));
-        assert!(watcher_path_is_relevant(directory, true, false));
+    fn create_remove_and_rename_paths_keep_independent_final_state_semantics() {
+        let created = PathBuf::from("created");
+        let created_signals = classify_watcher_event(
+            Event::new(EventKind::Create(CreateKind::Any)).add_path(created.clone()),
+        );
+        let Signal::Paths(created_paths) = &created_signals[0] else {
+            panic!("create should be incremental");
+        };
+        assert_eq!(created_paths[0].path, created);
+        assert!(created_paths[0].scan_existing_directory);
+        assert!(!created_paths[0].include_missing);
 
-        let missing_path = Path::new("purewall-watcher-missing-directory-entry");
-        assert!(!missing_path.exists());
-        assert!(watcher_path_is_relevant(missing_path, false, true));
-        assert!(watcher_path_is_relevant(
-            Path::new("changed-wallpaper.jpg"),
-            false,
-            false
-        ));
+        let removed = PathBuf::from("removed");
+        let removed_signals = classify_watcher_event(
+            Event::new(EventKind::Remove(RemoveKind::Any)).add_path(removed.clone()),
+        );
+        let Signal::Paths(removed_paths) = &removed_signals[0] else {
+            panic!("remove should be incremental");
+        };
+        assert_eq!(removed_paths[0].path, removed);
+        assert!(!removed_paths[0].scan_existing_directory);
+        assert!(removed_paths[0].include_missing);
+
+        let from = PathBuf::from("rename-from");
+        let to = PathBuf::from("rename-to");
+        let rename_signals = classify_watcher_event(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path(from.clone())
+                .add_path(to.clone()),
+        );
+        let Signal::Paths(rename_paths) = &rename_signals[0] else {
+            panic!("rename should be incremental");
+        };
+        assert_eq!(rename_paths.len(), 2);
+        assert_eq!(rename_paths[0].path, from);
+        assert_eq!(rename_paths[1].path, to);
+        assert!(rename_paths
+            .iter()
+            .all(|path| path.scan_existing_directory && path.include_missing));
     }
 }

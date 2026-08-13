@@ -1,8 +1,7 @@
 use crate::{
-    batch_operations, db, require_batch_wallpaper_files, require_existing_collection,
-    require_existing_tag, require_registered_wallpaper_file, require_registered_wallpaper_files,
-    save_display_title_with_writer, shell_metadata, AppState, CommandError, CommandResult,
-    DeleteResult,
+    batch_operations, db, deletion, require_batch_wallpaper_files, require_existing_collection,
+    require_existing_tag, require_registered_wallpaper_file, save_display_title_with_writer,
+    shell_metadata, AppState, CommandError, CommandResult, DeleteResult,
 };
 
 #[tauri::command]
@@ -282,54 +281,5 @@ pub(crate) fn batch_delete_wallpapers(
     state: tauri::State<AppState>,
     paths: Vec<String>,
 ) -> CommandResult<Vec<DeleteResult>> {
-    let paths = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        require_registered_wallpaper_files(&db, &paths)?
-    };
-
-    let mut results = Vec::with_capacity(paths.len());
-    let mut removed_paths = Vec::new();
-
-    for path in paths {
-        #[cfg(windows)]
-        let delete_result = trash::delete(&path);
-
-        #[cfg(not(windows))]
-        let delete_result = std::fs::remove_file(&path);
-
-        match delete_result {
-            Ok(()) => {
-                removed_paths.push(path.clone());
-                results.push(DeleteResult {
-                    path,
-                    deleted: true,
-                    message: None,
-                });
-            }
-            Err(error) => results.push(DeleteResult {
-                path,
-                deleted: false,
-                message: Some(error.to_string()),
-            }),
-        }
-    }
-
-    if !removed_paths.is_empty() {
-        let db_result = state
-            .db
-            .lock()
-            .map_err(|e| e.to_string())?
-            .remove_wallpapers(&removed_paths);
-
-        if let Err(error) = db_result {
-            let message = format!("Moved to Recycle Bin, but database cleanup failed: {error}");
-            for result in &mut results {
-                if result.deleted {
-                    result.message = Some(message.clone());
-                }
-            }
-        }
-    }
-
-    Ok(results)
+    deletion::delete_many(&state.db, paths)
 }

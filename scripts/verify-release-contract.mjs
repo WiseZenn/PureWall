@@ -217,7 +217,7 @@ const requiredReleaseWorkflowMarkers = [
   ["updater public key", "TAURI_SIGNING_PUBLIC_KEY"],
   ["Authenticode certificate", "WINDOWS_CERTIFICATE"],
   ["draft release", "releaseDraft: true"],
-  ["artifact attestation", "actions/attest@v4"],
+  ["artifact attestation", /actions\/attest@[0-9a-f]{40}/],
   ["checksum file", "SHA256SUMS.txt"],
 ];
 
@@ -241,8 +241,14 @@ function validateWorkflowMarkers(path, requiredMarkers, forbiddenMarkers, opts =
   const loaded = loadWorkflowContract(path, opts);
   if (loaded.error) return [loaded.error];
   const failures = [];
-  for (const [label, marker] of requiredMarkers) {
+  for (const [label, marker] of requiredMarkers.filter(([, m]) => typeof m === "string")) {
     if (!loaded.content.includes(marker)) failures.push(`${path} missing ${label} marker: ${marker}`);
+  }
+  // Regex-required markers (e.g. actions pinned to a commit SHA instead of a
+  // mutable tag like actions/attest@v4). marker is [label, pattern]; content is
+  // matched with the pattern against the raw file.
+  for (const [label, pattern] of requiredMarkers.filter(([, m]) => m instanceof RegExp)) {
+    if (!pattern.test(loaded.content)) failures.push(`${path} missing ${label} marker: ${pattern}`);
   }
   const lowerContent = loaded.content.toLowerCase();
   for (const [label, marker] of forbiddenMarkers) {
@@ -430,7 +436,7 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         with:
           releaseDraft: true
-      - uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
       - run: echo "SHA256SUMS.txt"
 `;
 

@@ -1,11 +1,11 @@
 use crate::{
     active_preview, advance_independent_wallpapers, advance_shared_wallpaper, current_display_mode,
-    db, emit_focus_mode_status, execute_playback_action, execute_playback_action_for_caller, focus,
-    is_valid_display_mode, legacy_pause_state, legacy_wallpaper_path, persist_current_wallpaper,
-    playback_command_error, read_current_wallpaper_path, require_registered_wallpaper_file,
-    sync_pause_state_from_settings, wallpaper, AppState, CommandError, CommandResult,
-    PlaybackAction, PlaybackActionOutcome, MAX_ROTATION_SECS, SETTING_DISPLAY_MODE,
-    SETTING_FOCUS_MODE, SETTING_ROTATION_SECS,
+    db, deletion, emit_focus_mode_status, execute_playback_action,
+    execute_playback_action_for_caller, focus, is_valid_display_mode, legacy_pause_state,
+    legacy_wallpaper_path, persist_current_wallpaper, playback_command_error,
+    read_current_wallpaper_path, require_registered_wallpaper_file, sync_pause_state_from_settings,
+    wallpaper, AppState, CommandError, CommandResult, PlaybackAction, PlaybackActionOutcome,
+    MAX_ROTATION_SECS, SETTING_DISPLAY_MODE, SETTING_FOCUS_MODE, SETTING_ROTATION_SECS,
 };
 use std::sync::atomic::Ordering;
 use tauri::Emitter;
@@ -86,23 +86,11 @@ pub(crate) fn reset_rating(state: tauri::State<AppState>, path: String) -> Comma
 }
 
 #[tauri::command]
-pub(crate) fn delete_wallpaper(state: tauri::State<AppState>, path: String) -> CommandResult<()> {
-    let path = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        require_registered_wallpaper_file(&db, &path)?
-    };
-
-    // Move to recycle bin
-    #[cfg(windows)]
-    trash::delete(&path).map_err(|e| e.to_string())?;
-
-    #[cfg(not(windows))]
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.remove_wallpaper(&path).map_err(|e| e.to_string())?;
-
-    Ok(())
+pub(crate) fn delete_wallpaper(
+    state: tauri::State<AppState>,
+    path: String,
+) -> CommandResult<crate::DeleteResult> {
+    deletion::delete_one(&state.db, path)
 }
 
 #[tauri::command]

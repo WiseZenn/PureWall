@@ -2,7 +2,7 @@ use crate::{
     begin_source_operation, db, ensure_runtime_folder_watcher, library_source_entry,
     library_sources, paths, record_source_error, scan_and_persist_source_snapshot, scanner,
     source_database_error, source_path_error, take_runtime_folder_watcher, validate_source_folder,
-    AppState, CommandError, CommandResult, ImportResult,
+    AppState, CommandError, CommandResult, ImportResult, ReconciliationOutcome,
 };
 use std::path::Path;
 use tauri::Emitter;
@@ -30,12 +30,16 @@ pub(crate) fn rescan_source(
     })();
 
     match result {
-        Ok(summary) => {
+        Ok(ReconciliationOutcome::Applied(summary)) => {
             if let Err(error) = app.emit("folder-changed", summary.clone()) {
                 eprintln!("[PureWall] Failed to emit source rescan completion: {error}");
             }
             Ok(summary)
         }
+        Ok(ReconciliationOutcome::SkippedStale) => Err(CommandError::new(
+            "SOURCE_STALE",
+            "The library source changed before its rescan could be saved.",
+        )),
         Err(error) => {
             record_source_error(state, &folder.path, &error.message);
             Err(error)
@@ -160,6 +164,9 @@ pub(crate) fn remove_library_source(
         }
     };
     drop(removed_watcher);
+    state
+        .watcher_queue
+        .remove_root(&folder.path, &folder.source);
 
     let unavailable_wallpapers = match mode {
         library_sources::RemoveLibrarySourceMode::KeepMetadata => summary.affected_wallpapers,
@@ -257,15 +264,25 @@ pub(crate) fn relocate_library_source(
         }
     };
     drop(old_watcher);
+    state
+        .watcher_queue
+        .remove_root(&folder.path, &folder.source);
 
     match ensure_runtime_folder_watcher(&app, &target, &folder.source) {
         Ok(_) => {
-            if let Err(error) = scan_and_persist_source_snapshot(&state, &target, &folder.source) {
-                record_source_error(&state, &target, &error.message);
-                warnings.push(format!(
-                    "Relocation committed, but the handoff rescan failed: {}",
-                    error.message
-                ));
+            match scan_and_persist_source_snapshot(&state, &target, &folder.source) {
+                Ok(ReconciliationOutcome::Applied(_)) => {}
+                Ok(ReconciliationOutcome::SkippedStale) => warnings.push(
+                    "Relocation committed, but the source changed before the handoff rescan could be saved."
+                        .to_string(),
+                ),
+                Err(error) => {
+                    record_source_error(&state, &target, &error.message);
+                    warnings.push(format!(
+                        "Relocation committed, but the handoff rescan failed: {}",
+                        error.message
+                    ));
+                }
             }
         }
         Err(error) => {

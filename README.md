@@ -1,216 +1,154 @@
-# PureWall
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="PureWall logo" width="88" />
+</p>
 
-PureWall is an open-source Windows wallpaper manager built with Tauri 2, Vue 3, TypeScript, Rust, Tailwind CSS, and SQLite. It focuses on a straightforward local-library loop: play wallpapers, move to the next one, and teach the rotation through Like and Dislike.
+<h1 align="center">PureWall</h1>
 
-![PureWall product interface preview](design/PureWall-Living-Gallery-Fusion.png)
+<p align="center">A local-first Windows wallpaper library — browse, organize, and rotate the images you already own.</p>
 
-_Product interface preview — a committed design reference for the local-library workbench, not installer or release-test evidence._
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2ea44f.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/Windows-10%2F11-0078D4.svg" alt="Windows 10 or 11">
+  <img src="https://img.shields.io/badge/Tauri-2-24C8DB.svg" alt="Tauri 2">
+  <a href="https://github.com/WiseZenn/PureWall/actions/workflows/ci.yml"><img src="https://github.com/WiseZenn/PureWall/actions/workflows/ci.yml/badge.svg" alt="CI workflow"></a>
+  <br>
+  <sub>Source build · no published binary release yet</sub>
+</p>
 
-![PureWall icon motion](design/purewall-icon-motion.gif)
+<p align="center">
+  <img src="docs/images/screenshot-library-dark.webp" alt="PureWall library workspace in dark theme" width="49%">
+  <img src="docs/images/screenshot-library-light.webp" alt="PureWall library workspace in light theme" width="49%">
+</p>
 
-_Icon motion — the committed compatibility GIF for PureWall's brand motion._
+<p align="center"><em>Real Vue render with mocked Tauri synthetic data; not native WebView2 or release evidence.</em></p>
+
+## Why PureWall
+
+PureWall is a quiet, local Windows workbench for the wallpaper files already on your drives. It stores metadata in SQLite while leaving original images at their existing paths.
+
+| | | |
+| --- | --- | --- |
+| 🗂️ **Local-first library**<br>Import folders or images without copying originals. | 🎲 **Liked-weighted rotation**<br>Random playback gives liked wallpapers extra weight. |
+| 🏷️ **Tags & collections**<br>Organize, hide, search, and batch-edit large libraries. | 🖥️ **Multi-display**<br>Use the same image, span one image, or rotate independently. |
+| 🪟 **Floating widget**<br>Keep Next, Like, and Dislike close at hand. | 💾 **Backup & restore**<br>Protect PureWall metadata without rewriting source files. |
+| ⏸️ **Focus pause**<br>Pause rotation while a full-screen app has focus. | 📈 **Yearly insights**<br>Review playback history and patterns over time. |
+
+Other built-in controls include light/dark themes, Quiet Canvas, optional HKCU-only context-menu and autostart integrations, and an explicit pause control.
+
+## Built for the files you already own
+
+- **References, not imports:** PureWall indexes source paths and keeps originals in place.
+- **Metadata stays local:** ratings, tags, collections, settings, caches, and play history use the local SQLite store in `%APPDATA%\com.purewall.app`.
+- **Useful at library scale:** pagination, search, hidden items, batch actions, and cached previews keep everyday browsing focused.
+- **Windows-aware playback:** wallpaper application understands same, span, and independent display modes.
+- **Optional by design:** widget, focus pause, autostart, and context-menu actions can be enabled only when wanted.
+
+PureWall does not include an online wallpaper feed or recommendation service. PureWall-X and shared-core extraction are intentionally deferred; see [ROADMAP.md](ROADMAP.md).
+
+## At a glance
+
+| Area | Choice |
+| --- | --- |
+| Desktop shell | Tauri 2 + WebView2 |
+| Interface | Vue 3 + TypeScript |
+| Native layer | Rust + Windows APIs |
+| Persistence | SQLite metadata under the local app-data boundary |
+| License | MIT |
+
+The maintainable public architecture is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Project status
 
-PureWall's local application foundation is implemented, and Phase 5 is building the public release loop. The repository currently provides local build and verification commands. It does **not** claim that signing, updater delivery, remote CI, or clean install/upgrade/uninstall smoke has run unless a specific published release records that evidence.
+The local application foundation and maintainability work are implemented. The first public release loop is prepared but still awaits external evidence: a green hosted Windows CI run, signing configuration, an authorized tag, draft-release verification, and disposable-runner installer smoke. This README does not claim those gates have run.
 
-No tagged public release should be assumed from this README alone. Until a verified release is published, build from source and treat release automation, signing, updates, and installer lifecycle evidence as pending work tracked in [ROADMAP.md](ROADMAP.md).
+## Safety Promise
 
-## What PureWall does
+PureWall is designed to be conservative around your files and Windows configuration:
 
-- Imports local wallpaper folders or selected image files without copying the originals into app data.
-- Browses large libraries with local metadata, search, tags, collections, hidden items, and batch actions.
-- Rotates wallpapers with a liked-weighted random choice and explicit Next, Like, Dislike, and Pause controls.
-- Sends user-confirmed file deletion to the Windows Recycle Bin.
-- Supports same, span, and independent multi-display wallpaper placement.
-- Offers optional PureWall-owned desktop context-menu and autostart integrations.
-- Keeps SQLite metadata, settings, derivative caches, and play history under `%APPDATA%\com.purewall.app`.
-- Provides a floating widget, light/dark themes, Quiet Canvas, metadata backup/restore, and compact yearly insights.
+- It writes only PureWall-owned entries under **HKCU** for its optional context menu and autostart features.
+- It never writes **HKLM** and never changes Windows 11 shell policy or context-menu settings.
+- It deletes only explicitly selected registered wallpaper file(s)—a single file or a validated batch—and uses a project-owned Windows Shell Recycle Bin operation after confirmation. It never recursively deletes folders or auto-confirms permanent deletion; an explicit Windows permanent-delete choice is treated as an unknown outcome and metadata is retained.
+- It accepts local fixed-volume Windows paths and rejects UNC, mapped/remote, removable/unknown volumes, reparse-backed paths, and other unsafe paths; rejected paths can be removed through Explorer instead. OneDrive/provider paths are rejected when their reparse/provider boundary is observable. Because Windows Shell deletion is path-bound rather than handle-bound, an active same-user process can still replace a path after final validation and during the Shell window; that residual race is not claimed to be eliminated.
 
-## Five-step local-library quick start
+## Quick start
 
-1. Install a verified published Windows build from [PureWall Releases](https://github.com/WiseZenn/PureWall/releases) when one is available, or complete the source build below and launch PureWall.
-2. Choose **Import folder** or import selected files from a local drive. PureWall accepts JPG/JPEG, PNG, BMP, and WebP; UNC paths and mapped network drives are rejected.
-3. Browse the library and use Like, Dislike, tags, collections, or Hidden to organize what you already own.
-4. Use Next or choose a rotation interval. Liked wallpapers receive additional selection weight while the sequence remains random.
-5. Enable the floating widget, autostart, focus pause, or desktop context menu only if you want those optional local integrations.
+### Install a release
 
-PureWall references original image paths. Moving or deleting an original outside PureWall can make the item unavailable, but its local rating, title, tag, and collection metadata is retained for recovery.
+When a verified build is published, install it from [PureWall Releases](https://github.com/WiseZenn/PureWall/releases). There is no published binary release yet; do not treat a local build as release evidence.
 
-## Windows install and download verification
+### Build from source
 
-When a release is published, open [PureWall Releases](https://github.com/WiseZenn/PureWall/releases), select the exact version you intend to install, and obtain every file only from that matching release page. Expected Windows deliverables may include an NSIS `*-setup.exe`, an MSI `*.msi`, or an advanced/manual executable. The matching release notes must state which artifacts are supported and which signing, lifecycle, and provenance checks actually ran.
-
-When a release provides `SHA256SUMS.txt`, download it from the same release and compare the artifact hash:
-
-```powershell
-Get-FileHash .\PureWall_<version>_x64-setup.exe -Algorithm SHA256
-Get-Content .\SHA256SUMS.txt
-```
-
-The hexadecimal value must exactly match the corresponding line. A filename is not proof of origin.
-
-If release notes designate an artifact as Authenticode-signed, verify it before running:
-
-```powershell
-Get-AuthenticodeSignature .\PureWall_<version>_x64-setup.exe | Format-List Status,StatusMessage,SignerCertificate
-```
-
-The expected status is `Valid`, with the signer described by that release. Do not bypass an unexpected SmartScreen or signature warning merely because the file is named PureWall.
-
-When release notes state that GitHub artifact provenance is available, verify it with GitHub CLI:
-
-```powershell
-gh attestation verify .\PureWall_<version>_x64-setup.exe --repo WiseZenn/PureWall
-```
-
-Checksums, Authenticode, updater signatures, and GitHub provenance are separate controls. Their future design is documented, but only evidence attached to an actually run release counts as verification.
-
-## Maintainer release automation
-
-Releases are driven by pushing a `v<SemVer>` tag that matches all three application version declarations (`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`). The tag push runs `.github/workflows/release.yml`, which builds, signs, checksums, and attests the Windows artifacts, then creates **only a draft** GitHub Release. Publishing the draft is a deliberate maintainer action after review. Manual `workflow_dispatch` dry-runs build and attest artifacts without creating a release unless `publishDraft` is explicitly enabled.
-
-Provision these GitHub Actions **secrets** (names only; values are never committed or documented here):
-
-```text
-WINDOWS_CERTIFICATE                 base64-encoded PFX containing the Authenticode code-signing certificate
-WINDOWS_CERTIFICATE_PASSWORD        password for that PFX
-WINDOWS_CERTIFICATE_TIMESTAMP_URL   HTTPS RFC 3161 timestamp server URL
-TAURI_SIGNING_PRIVATE_KEY           Tauri updater signing private key (base64)
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD  optional password for the updater private key
-```
-
-And this repository **variable**:
-
-```text
-TAURI_SIGNING_PUBLIC_KEY   Tauri updater signing public key
-```
-
-Rotate `TAURI_SIGNING_PRIVATE_KEY` together with the code-signing certificate and a published release: every released updater artifact must be verifiable with the key shipped in the next release. Keep the public key and certificate recoverable in a protected store — losing the updater private key or letting the code-signing certificate expire blocks future signed releases. Timestamped Authenticode signatures remain valid after certificate expiry, so the HTTPS timestamp URL is required at build time.
-
-Draft review checklist before publishing a release:
-
-1. Confirm every artifact on the draft is Authenticode `Valid` (`Get-AuthenticodeSignature`).
-2. Confirm `SHA256SUMS.txt` matches every downloaded artifact (`Get-FileHash -Algorithm SHA256`).
-3. Confirm the updater `latest.json` and `.sig` signatures match the artifacts.
-4. Confirm provenance with `gh attestation verify <artifact> --repo WiseZenn/PureWall`.
-5. Only then publish the draft and record the release evidence.
-
-Checksums, Authenticode, updater signatures, and GitHub provenance are separate controls; see the install verification section above for consumer-side commands.
-
-## Contributor first-build quick start
-
-Requirements:
-
-- Windows 10 or 11.
-- Node.js `20.19+` or `22.12+`.
-- Rust stable with the MSVC toolchain.
-- Microsoft Edge WebView2 Runtime.
-- Git.
-
-From a clean clone:
+Requirements: Windows 10 or 11, Node.js `20.19+` or `22.12+`, Rust stable with the MSVC toolchain, WebView2, and Git.
 
 ```powershell
 git clone https://github.com/WiseZenn/PureWall.git
 cd PureWall
 npm ci
-npm run test:release-contract
-npm run verify:release
 npx vue-tsc --noEmit
-npm run test:unit
 npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 npm run tauri build
 ```
 
-`npm run tauri build` is the first complete local packaging command. A successful local package is not proof of remote CI, signing, provenance, updater delivery, or installer lifecycle testing.
+Launch a development instance with `npm run tauri dev`. Once PureWall opens, choose **Import Folder** or **Import Images**, then select a local folder or files. Supported formats are JPG/JPEG, PNG, BMP, and WebP. PureWall keeps the originals where they are and stores metadata under `%APPDATA%\com.purewall.app`.
 
-For interactive development:
+For maintainer release checks, signing, draft review, and installer smoke boundaries, see [docs/RELEASING.md](docs/RELEASING.md).
 
-```powershell
-npm run tauri dev
-```
+## Screenshots
 
-Native development uses PureWall's normal Windows app-data boundary. Use a disposable Windows account and a synthetic wallpaper library for destructive or integration testing; never treat a browser mock as native Windows evidence.
+<p align="center">
+  <img src="docs/images/screenshot-inspector-dark.webp" alt="PureWall wallpaper inspector in dark theme" width="49%">
+  <img src="docs/images/screenshot-inspector-light.webp" alt="PureWall wallpaper inspector in light theme" width="49%">
+</p>
+<p align="center">
+  <img src="docs/images/screenshot-displays-dark.webp" alt="PureWall display settings in dark theme" width="49%">
+  <img src="docs/images/screenshot-displays-light.webp" alt="PureWall display settings in light theme" width="49%">
+</p>
+
+- **Inspector** — selected-wallpaper metadata, tags, actions, and playback controls.
+- **Displays** — same, span, or independent display modes.
+
+These are real Vue renders with mocked Tauri synthetic data, not native WebView2 or release evidence. Regenerate them with `npm run qa:screenshots`; set `PW_PLAYWRIGHT_PATH` or `PW_CHROME_PATH` when using a separately installed Windows QA toolchain. On Windows, the Chrome fallback is `C:\Program Files\Google\Chrome\Application\chrome.exe`.
+
+## Brand mark
+
+<p align="center">
+  <img src="design/purewall-icon-motion.webp" alt="PureWall animated icon mark" width="220">
+</p>
+
+The brand mark is a wallpaper card stack with a next arrow—the small visual cue behind PureWall's rotation loop.
 
 ## FAQ
 
-### Does PureWall upload my library or metadata?
+### Is PureWall local-only?
 
-No online wallpaper service or feed is part of current PureWall. Original images remain at their local paths, and application metadata is stored in the local SQLite database under `%APPDATA%\com.purewall.app`. Ordinary use does not require a cloud account.
+Yes. Original images stay at their existing paths. SQLite metadata, settings, caches, and history live under `%APPDATA%\com.purewall.app`; ordinary use does not require an account or cloud library.
 
-### Which files and paths are supported?
+### Which image formats and paths are supported?
 
-PureWall imports JPG/JPEG, PNG, BMP, and WebP from local Windows paths. UNC paths, extended UNC paths, and mapped network drives are rejected. Symbolic-link entries are skipped during recursive folder scans.
+JPG/JPEG, PNG, BMP, and WebP on local Windows drives. UNC paths and mapped network drives are rejected.
 
-### What happens when I delete a wallpaper in PureWall?
+### Does deleting an item permanently delete the file?
 
-After the UI's pending-delete/Undo window completes, PureWall sends only the selected, registered wallpaper file to the Windows Recycle Bin and then removes its library row. It does not recursively delete a source folder. Test delete behavior only with disposable files.
+No automatic permanent deletion. After confirmation and the pending Undo window, PureWall sends only explicitly selected registered wallpaper file(s)—a single file or a validated batch on a local fixed volume—to a project-owned Windows Shell operation configured for recycling. PureWall rejects observed reparse/provider boundaries, requires observed Recycle Bin evidence before removing metadata, never auto-confirms a permanent-delete prompt, and treats an explicit Windows permanent-delete choice or missing evidence as unknown with metadata retained. Because the Windows Shell operation is path-bound rather than handle-bound, an active same-user process can still replace a path after final validation and during the Shell window; this residual race cannot be eliminated by PureWall.
 
-### What happens if a source file disappears outside PureWall?
+### Why might Windows SmartScreen warn me?
 
-PureWall marks the source unavailable in normal library views while retaining recoverable metadata such as rating, title, tags, and collections. Restore the file, rescan/retry the source, or use source relocation when the folder moved.
+Source builds and unsigned binaries can trigger reputation warnings. Do not bypass an unexpected warning. For a release artifact, check the release notes, checksum, signer, and provenance when those controls are provided.
 
-### Why does Windows SmartScreen warn about a build?
+### Is the updater ready?
 
-Local source builds and unsigned artifacts can trigger Windows reputation warnings. A future releasable artifact must have explicit Authenticode and release evidence, but this repository does not claim that every available binary is signed. Verify the release checksum, signer, and provenance when provided; do not bypass an unexpected warning.
+The Tauri updater path is implemented and unit-tested at the state-machine and UI level (pending-update handling, retry after failed download). Signature acceptance/rejection is enforced by the Tauri updater plugin and its mandatory signature checks, but no repository test exercises real cryptographic signatures, and the path has not been exercised against a real signed release. Until a release documents that evidence, prefer downloading a newer release from the matching Releases page and verifying it independently.
 
-### Does PureWall update itself?
+## Contributing, support, and security
 
-PureWall ships a signature-verified update path (Tauri updater): the Settings panel can check for updates, review release notes, and explicitly download/install an update. Update artifacts are fetched only over HTTPS and verified with Tauri's mandatory signature checks. That path is implemented and unit-tested, but it has not yet been exercised against a real signed release: until a published release documents its updater endpoint, treat updates as unverified and prefer downloading the newer release, verifying it independently, and following its release notes. See [ROADMAP.md](ROADMAP.md).
-
-### Where do generated screenshots and design candidates belong?
-
-Curated public images live under `design/` or `docs/images/`. Raw generated candidates and QA captures stay in ignored `output/`. See [docs/REPOSITORY_POLICY.md](docs/REPOSITORY_POLICY.md).
-
-## Troubleshooting
-
-### The window is blank or WebView2 is unavailable
-
-Install or repair the Microsoft Edge WebView2 Runtime, apply supported Windows updates, then retry. For a source build, confirm the frontend gate (`npm run build`) passes before diagnosing native rendering.
-
-### A folder or file is rejected
-
-Confirm the path is on a local Windows drive and the file extension is JPG/JPEG, PNG, BMP, or WebP. Network shares, UNC paths, mapped network drives, and unsupported image types are intentionally rejected. Copy the files to a local folder if you want PureWall to manage them.
-
-### Previously imported wallpapers are missing
-
-Check whether the original file or source folder was moved, renamed, disconnected, or deleted. Open the library-source settings to rescan, retry, or relocate the source. PureWall preserves metadata for unavailable files rather than silently deleting it.
-
-### Autostart or desktop context-menu actions do not appear
-
-Disable and re-enable the integration from PureWall, then capture a redacted bug report if it still fails. These controls are limited to PureWall-owned HKCU entries. Do not enable legacy Windows menus, edit HKLM, or change Windows shell policy as a workaround.
-
-### Cargo, Vite, or npm reports build-cache access denied
-
-Close only development/build processes you started, ensure the clone and its `node_modules`, `dist`, and `src-tauri/target` paths are writable, then rerun the same command from a normal developer PowerShell. Do not delete `%APPDATA%\com.purewall.app` or change system policy to solve a compiler-cache permission error. When reporting the problem, include the command and redacted cache path.
-
-## Optional integration cleanup
-
-Before uninstalling, disable Autostart and unregister the desktop context menu inside PureWall. Those actions target only PureWall-owned HKCU entries:
-
-```text
-HKCU\Software\Classes\Directory\Background\shell\PureWall
-HKCU\Software\Classes\Directory\Background\shell\PWNext
-HKCU\Software\Classes\Directory\Background\shell\PWLike
-HKCU\Software\Classes\Directory\Background\shell\PWDislike
-HKCU\Software\Classes\Directory\Background\shell\PWPause
-HKCU\Software\Classes\PureWall_Commands
-HKCU\Software\Microsoft\Windows\CurrentVersion\Run\PureWall
-```
-
-PureWall does not need HKLM cleanup and must not alter Windows shell policy keys.
-
-## Contributing and support
-
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing code or public artifacts.
-- Use [SUPPORT.md](SUPPORT.md) to choose Discussions, a reproducible bug report, or a private security advisory.
-- Read [SECURITY.md](SECURITY.md) before testing file, registry, installer, traversal, IPC, or updater/signature boundaries.
-- Engineering architecture and accepted decisions live under `docs/project-docs/`.
+- [Contributing guide](CONTRIBUTING.md) — development setup, checks, and pull requests.
+- [Architecture](docs/ARCHITECTURE.md) — public contributor-facing system overview.
+- [Support](SUPPORT.md) — discussions and reproducible bug reports.
+- [Security policy](SECURITY.md) — private reporting and safety boundaries.
+- [Releases](https://github.com/WiseZenn/PureWall/releases) — published builds when available.
 
 ## License
 
-PureWall is released under the MIT License. See [LICENSE](LICENSE).
+PureWall is released under the [MIT License](LICENSE). See the license text for terms.
