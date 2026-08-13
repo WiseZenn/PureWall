@@ -198,12 +198,6 @@ fn unique_test_directory_name(run_id: &str) -> String {
 }
 
 #[cfg(test)]
-fn unique_test_run_id(prefix: &str) -> String {
-    let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{}-{sequence}", std::process::id())
-}
-
-#[cfg(test)]
 fn create_unmarked_test_child(run_id: &str) -> PathBuf {
     let owned = OwnedRunRoot::create_for_test(run_id).expect("create marked test root");
     let root = owned.retain();
@@ -418,11 +412,15 @@ fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
     path.starts_with(&prefix)
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    same_path(left, right) || is_strict_descendant(left, right) || is_strict_descendant(right, left)
+}
+
 fn protected_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn reject_protected_targets(target: &Path) -> Result<()> {
+fn reject_protected_targets_with(target: &Path, repository: &Path, app_data: &Path) -> Result<()> {
     let drive_root = target
         .ancestors()
         .last()
@@ -431,19 +429,22 @@ fn reject_protected_targets(target: &Path) -> Result<()> {
         bail!("performance cleanup target is a drive root");
     }
 
+    if paths_overlap(target, repository) {
+        bail!("performance cleanup target overlaps the repository");
+    }
+    if paths_overlap(target, app_data) {
+        bail!("performance cleanup target overlaps PureWall AppData");
+    }
+    Ok(())
+}
+
+fn reject_protected_targets(target: &Path) -> Result<()> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| anyhow!("performance repository root is unavailable"))?;
     let repository = protected_path(repository);
-    if same_path(target, &repository) || is_strict_descendant(target, &repository) {
-        bail!("performance cleanup target overlaps the repository");
-    }
-
     let app_data = protected_path(&crate::paths::app_data_dir());
-    if same_path(target, &app_data) || is_strict_descendant(target, &app_data) {
-        bail!("performance cleanup target overlaps PureWall AppData");
-    }
-    Ok(())
+    reject_protected_targets_with(target, &repository, &app_data)
 }
 
 fn validate_marker(root: &Path, run_id: &str) -> Result<()> {
@@ -801,7 +802,58 @@ mod tests {
     }
 
     #[test]
+    fn repository_overlap_is_rejected_in_both_directions() {
+        let repository = Path::new(r"C:\synthetic-repository-parent\repository");
+        let app_data = Path::new(r"C:\synthetic-app-data-parent\app-data");
+
+        for target in [
+            repository.to_path_buf(),
+            repository.join("nested-run"),
+            repository.parent().unwrap().to_path_buf(),
+        ] {
+            assert_eq!(
+                reject_protected_targets_with(&target, repository, app_data)
+                    .unwrap_err()
+                    .to_string(),
+                "performance cleanup target overlaps the repository"
+            );
+        }
+        assert!(reject_protected_targets_with(
+            Path::new(r"C:\synthetic-repository-parent\repository-backup\run"),
+            repository,
+            app_data
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn app_data_overlap_is_rejected_in_both_directions() {
+        let repository = Path::new(r"C:\synthetic-repository-parent\repository");
+        let app_data = Path::new(r"C:\synthetic-app-data-parent\app-data");
+
+        for target in [
+            app_data.to_path_buf(),
+            app_data.join("nested-run"),
+            app_data.parent().unwrap().to_path_buf(),
+        ] {
+            assert_eq!(
+                reject_protected_targets_with(&target, repository, app_data)
+                    .unwrap_err()
+                    .to_string(),
+                "performance cleanup target overlaps PureWall AppData"
+            );
+        }
+        assert!(reject_protected_targets_with(
+            Path::new(r"C:\synthetic-app-data-parent\app-data-backup\run"),
+            repository,
+            app_data
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn create_rejects_invalid_run_ids_and_existing_roots() {
+        assert!(OwnedRunRoot::create("").is_err());
         for invalid in ["", "space here", "slash/name", ".", "风景"] {
             assert!(
                 OwnedRunRoot::create_for_test(invalid).is_err(),
@@ -809,23 +861,27 @@ mod tests {
             );
         }
 
-        let production_run_id = unique_test_run_id("production");
-        let production = OwnedRunRoot::create(&production_run_id).unwrap();
-        assert_eq!(
-            production.root().file_name().unwrap(),
-            production_run_id.as_str()
-        );
-        production.cleanup().unwrap();
+        assert!(directory_name_matches_run_id(
+            "production-run",
+            "production-run"
+        ));
+        assert!(!directory_name_matches_run_id(
+            "production-run-other",
+            "production-run"
+        ));
 
-        let directory_name = unique_test_directory_name("no-clobber");
-        let first =
-            OwnedRunRoot::create_under(&std::env::temp_dir(), &directory_name, "no-clobber")
-                .unwrap();
+        let first = OwnedRunRoot::create_for_test("no-clobber").unwrap();
+        let first_root = first.retain();
+        let directory_name = first_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_owned();
         let second =
             OwnedRunRoot::create_under(&std::env::temp_dir(), &directory_name, "no-clobber")
                 .unwrap_err();
         assert_eq!(second.to_string(), "performance run root already exists");
-        first.cleanup().unwrap();
+        remove_validated_test_root(&first_root, "no-clobber");
     }
 
     #[test]
