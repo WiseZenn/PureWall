@@ -3,7 +3,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
@@ -118,6 +118,9 @@ enum MutationOperation {
     Addition,
     Removal,
     Recovery,
+    BaselineRestoreAddition,
+    BaselineRestoreOriginal,
+    BaselineRestoreAbsentAddition,
 }
 
 impl MutationOperation {
@@ -126,13 +129,21 @@ impl MutationOperation {
             Self::Addition => "performance dataset mutation addition",
             Self::Removal => "performance dataset mutation removal",
             Self::Recovery => "performance dataset recovery",
+            Self::BaselineRestoreAddition | Self::BaselineRestoreAbsentAddition => {
+                "performance dataset baseline restore addition"
+            }
+            Self::BaselineRestoreOriginal => "performance dataset baseline restore original",
         }
     }
 
     fn expected_target_kind(self) -> MutationPathKind {
         match self {
-            Self::Addition | Self::Recovery => MutationPathKind::Missing,
-            Self::Removal => MutationPathKind::File,
+            Self::Addition | Self::Recovery | Self::BaselineRestoreAbsentAddition => {
+                MutationPathKind::Missing
+            }
+            Self::Removal | Self::BaselineRestoreAddition | Self::BaselineRestoreOriginal => {
+                MutationPathKind::File
+            }
         }
     }
 }
@@ -191,6 +202,14 @@ impl GeneratedDataset {
         let mut canonicalize = |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
         let mut link = |source: &Path, target: &Path| fs::hard_link(source, target);
         self.recover_removed_with(&mut inspect, &mut canonicalize, &mut link)
+    }
+
+    pub(crate) fn restore_baseline(&self) -> Result<()> {
+        let mut inspect = inspect_mutation_path_no_follow;
+        let mut canonicalize = |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+        let mut remove = |target: &Path| fs::remove_file(target);
+        self.restore_baseline_with(&mut inspect, &mut canonicalize, &mut remove)?;
+        self.verify_baseline_source_paths()
     }
 
     fn apply_incremental_mutations_with<I, C, H, R>(
@@ -284,6 +303,117 @@ impl GeneratedDataset {
             hard_link_with(backing, path, |source, target| link(source, target))?;
         }
         Ok(self.mutations.removals.clone())
+    }
+
+    fn restore_baseline_with<I, C, R>(
+        &self,
+        inspect: &mut I,
+        canonicalize: &mut C,
+        remove: &mut R,
+    ) -> Result<()>
+    where
+        I: FnMut(&Path) -> Result<MutationPathInspection>,
+        C: FnMut(&Path) -> Result<PathBuf>,
+        R: FnMut(&Path) -> std::io::Result<()>,
+    {
+        for path in &self.mutations.additions {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::BaselineRestoreAddition,
+                inspect,
+                canonicalize,
+            )?;
+        }
+        for path in &self.mutations.removals {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::BaselineRestoreOriginal,
+                inspect,
+                canonicalize,
+            )?;
+        }
+
+        for path in &self.mutations.additions {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::BaselineRestoreAddition,
+                inspect,
+                canonicalize,
+            )?;
+            remove(path).with_context(|| {
+                format!(
+                    "performance dataset baseline restore failed to remove deterministic addition {}",
+                    path.display()
+                )
+            })?;
+        }
+
+        for path in &self.mutations.additions {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::BaselineRestoreAbsentAddition,
+                inspect,
+                canonicalize,
+            )?;
+        }
+        for path in &self.mutations.removals {
+            self.validate_mutation_target_with(
+                path,
+                MutationOperation::BaselineRestoreOriginal,
+                inspect,
+                canonicalize,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn verify_baseline_source_paths(&self) -> Result<()> {
+        let mut scanned = BTreeSet::new();
+        for source_root in &self.source_roots {
+            let source = source_root.to_str().ok_or_else(|| {
+                anyhow!(
+                    "performance dataset baseline restore source root is not valid UTF-8: {}",
+                    source_root.display()
+                )
+            })?;
+            for image in crate::scanner::scan_folder(source).with_context(|| {
+                format!(
+                    "performance dataset baseline restore failed source scan for {}",
+                    source_root.display()
+                )
+            })? {
+                scanned.insert(fs::canonicalize(&image.path).with_context(|| {
+                    format!(
+                        "performance dataset baseline restore failed to canonicalize scanned path {}",
+                        image.path
+                    )
+                })?);
+            }
+        }
+
+        let expected = self
+            .absolute_paths
+            .iter()
+            .map(|path| {
+                fs::canonicalize(path).with_context(|| {
+                    format!(
+                        "performance dataset baseline restore expected original is missing: {}",
+                        path.display()
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if scanned.len() != self.manifest.item_count
+            || expected.len() != self.manifest.item_count
+            || scanned != expected
+        {
+            bail!(
+                "performance dataset baseline restore verification failed: expected exactly {} manifest paths, scanned {}",
+                self.manifest.item_count,
+                scanned.len()
+            );
+        }
+        Ok(())
     }
 
     fn validate_mutation_backing_with<'a, I>(
@@ -442,6 +572,18 @@ impl GeneratedDataset {
                     "performance dataset recovery target already exists: {}",
                     target.display()
                 ),
+                MutationOperation::BaselineRestoreAddition => bail!(
+                    "performance dataset baseline restore addition is not a regular file: {}",
+                    target.display()
+                ),
+                MutationOperation::BaselineRestoreOriginal => bail!(
+                    "performance dataset baseline restore original is not a regular file: {}",
+                    target.display()
+                ),
+                MutationOperation::BaselineRestoreAbsentAddition => bail!(
+                    "performance dataset baseline restore addition still exists: {}",
+                    target.display()
+                ),
             }
         }
         Ok(())
@@ -545,10 +687,35 @@ pub(crate) fn generate_dataset(
     scale: DatasetScale,
     seed: u64,
 ) -> Result<GeneratedDataset> {
-    if scale.requires_explicit_opt_in() {
+    validate_generation_authorization(scale, false)?;
+    generate_dataset_after_authorization(run, scale, seed)
+}
+
+pub(crate) fn generate_dataset_with_explicit_stress_opt_in(
+    run: &OwnedRunRoot,
+    scale: DatasetScale,
+    seed: u64,
+    allow_stress: bool,
+) -> Result<GeneratedDataset> {
+    validate_generation_authorization(scale, allow_stress)?;
+    generate_dataset_after_authorization(run, scale, seed)
+}
+
+fn validate_generation_authorization(scale: DatasetScale, allow_stress: bool) -> Result<()> {
+    if scale.requires_explicit_opt_in() && !allow_stress {
         bail!("performance dataset preflight failed: stress generation requires explicit opt-in");
     }
+    if !scale.requires_explicit_opt_in() && allow_stress {
+        bail!("performance dataset preflight failed: stress opt-in is valid only for stress scale");
+    }
+    Ok(())
+}
 
+fn generate_dataset_after_authorization(
+    run: &OwnedRunRoot,
+    scale: DatasetScale,
+    seed: u64,
+) -> Result<GeneratedDataset> {
     preflight_layout(scale)?;
     let available = available_space(run.root())?;
     preflight_space_with_available(scale, available)?;
@@ -1439,6 +1606,14 @@ mod tests {
     }
 
     #[test]
+    fn stress_generation_authorization_is_explicit_and_scale_specific() {
+        assert!(validate_generation_authorization(DatasetScale::Stress, false).is_err());
+        assert!(validate_generation_authorization(DatasetScale::Stress, true).is_ok());
+        assert!(validate_generation_authorization(DatasetScale::Ci, false).is_ok());
+        assert!(validate_generation_authorization(DatasetScale::Standard, false).is_ok());
+    }
+
+    #[test]
     fn preflight_space_failure_is_stable_and_precedes_generation() {
         let estimate = estimate_required_space(DatasetScale::Ci).unwrap();
         assert!(estimate.backing_bytes > 0);
@@ -1796,6 +1971,165 @@ mod tests {
             assert!(error.contains(&unsafe_target.display().to_string()));
             assert_eq!(mutation_calls.get(), 0);
             assert!(dataset.mutations.removals.iter().all(|path| !path.exists()));
+        });
+    }
+
+    #[test]
+    fn baseline_restore_removes_additions_and_returns_exact_manifest_paths() {
+        with_owned_run("dataset-restore-baseline", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            dataset.apply_incremental_mutations().unwrap();
+            dataset.recover_removed().unwrap();
+            assert_eq!(
+                dataset
+                    .source_roots
+                    .iter()
+                    .map(|root| image_count(root))
+                    .sum::<usize>(),
+                dataset.manifest.item_count + dataset.mutations.additions.len()
+            );
+
+            dataset.restore_baseline().unwrap();
+
+            assert!(dataset
+                .mutations
+                .additions
+                .iter()
+                .all(|path| !path.exists()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+            let scanned = dataset
+                .source_roots
+                .iter()
+                .flat_map(|root| crate::scanner::scan_folder(root.to_str().unwrap()).unwrap())
+                .map(|image| fs::canonicalize(image.path).unwrap())
+                .collect::<BTreeSet<_>>();
+            let expected = dataset
+                .absolute_paths
+                .iter()
+                .map(|path| fs::canonicalize(path).unwrap())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(scanned.len(), dataset.manifest.item_count);
+            assert_eq!(scanned, expected);
+        });
+    }
+
+    #[test]
+    fn baseline_restore_refuses_injected_target_reparse_before_any_change() {
+        with_owned_run("dataset-restore-target-link", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            dataset.apply_incremental_mutations().unwrap();
+            dataset.recover_removed().unwrap();
+            let unsafe_target = dataset.mutations.additions[0].clone();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| {
+                if path == unsafe_target {
+                    Ok(MutationPathInspection {
+                        kind: MutationPathKind::File,
+                        is_symlink: false,
+                        is_reparse_point: true,
+                    })
+                } else {
+                    inspect_mutation_path_no_follow(path)
+                }
+            };
+            let mut canonicalize =
+                |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .restore_baseline_with(&mut inspect, &mut canonicalize, &mut remove)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset baseline restore addition refused unsafe target (symlink/reparse): "
+            ));
+            assert!(error.contains(&unsafe_target.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(dataset
+                .mutations
+                .additions
+                .iter()
+                .all(|path| path.is_file()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn baseline_restore_refuses_canonical_parent_escape_before_any_change() {
+        with_owned_run("dataset-restore-physical-escape", |run| {
+            let dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            dataset.apply_incremental_mutations().unwrap();
+            dataset.recover_removed().unwrap();
+            let target_parent = dataset.mutations.additions[0]
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let escaped_parent = fs::canonicalize(&dataset.backing_dir).unwrap();
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| inspect_mutation_path_no_follow(path);
+            let mut canonicalize = |path: &Path| {
+                if path == target_parent {
+                    Ok(escaped_parent.clone())
+                } else {
+                    fs::canonicalize(path).map_err(anyhow::Error::from)
+                }
+            };
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .restore_baseline_with(&mut inspect, &mut canonicalize, &mut remove)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset baseline restore addition refused physical target parent outside source root: "
+            ));
+            assert!(error.contains(&target_parent.display().to_string()));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(dataset
+                .mutations
+                .additions
+                .iter()
+                .all(|path| path.is_file()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
+        });
+    }
+
+    #[test]
+    fn baseline_restore_refuses_wrong_target_before_any_change() {
+        with_owned_run("dataset-restore-wrong-target", |run| {
+            let mut dataset = generate_dataset(run, DatasetScale::Ci, DATASET_SEED).unwrap();
+            dataset.apply_incremental_mutations().unwrap();
+            dataset.recover_removed().unwrap();
+            let actual_additions = dataset.mutations.additions.clone();
+            dataset.mutations.additions[0] = run.root().join("outside-owned-sources.jpg");
+            let mutation_calls = Cell::new(0usize);
+            let mut inspect = |path: &Path| inspect_mutation_path_no_follow(path);
+            let mut canonicalize =
+                |path: &Path| fs::canonicalize(path).map_err(anyhow::Error::from);
+            let mut remove = |target: &Path| {
+                mutation_calls.set(mutation_calls.get() + 1);
+                fs::remove_file(target)
+            };
+
+            let error = dataset
+                .restore_baseline_with(&mut inspect, &mut canonicalize, &mut remove)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.starts_with(
+                "performance dataset baseline restore addition refused invalid lexical target outside registered source roots: "
+            ));
+            assert_eq!(mutation_calls.get(), 0);
+            assert!(actual_additions.iter().all(|path| path.is_file()));
+            assert!(dataset.mutations.removals.iter().all(|path| path.is_file()));
         });
     }
 
