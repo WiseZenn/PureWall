@@ -53,7 +53,8 @@ Phase 7A is building an isolated, repeatable performance evidence loop before ch
 - A feature-gated pre-Tauri harness uses deterministic synthetic data and production scanner, database, playback-selection, thumbnail, preview, and queue paths without touching PureWall AppData or a real wallpaper library.
 - Windows CI runs only the 120-item contract fixture. The local Standard scale is 10,000 items in one root; Stress is 100,000 items across ten roots and requires a separate explicit opt-in.
 - Reports preserve raw samples, median/P95, peak working set, correctness evidence, environment and dataset fingerprints, and fail-closed comparison results.
-- The next evidence step is an untouched Standard baseline and hotspot ranking. No production optimization or successful Stress run is claimed yet.
+- The first untouched Standard baseline is recorded and self-compares as stable. Its ranking selects `scan.full` as the only candidate hotspot for the next targeted optimization.
+- The next evidence step is a narrow `scan.full` change followed by a new Standard candidate run and fail-closed baseline comparison. No production optimization or successful Stress run is claimed yet.
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the contributor workflow and safety boundary.
 
