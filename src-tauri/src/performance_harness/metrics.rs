@@ -334,7 +334,11 @@ impl Drop for WorkingSetSampler {
 }
 
 fn micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().try_into().unwrap_or(u64::MAX)
+    duration
+        .as_nanos()
+        .div_ceil(1_000)
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(windows)]
@@ -411,6 +415,15 @@ mod tests {
         fn finish(self) -> Result<u64> {
             Ok(self.peak)
         }
+    }
+
+    #[test]
+    fn elapsed_microseconds_round_nonzero_submicrosecond_durations_up() {
+        assert_eq!(micros_u64(Duration::ZERO), 0);
+        assert_eq!(micros_u64(Duration::from_nanos(1)), 1);
+        assert_eq!(micros_u64(Duration::from_nanos(999)), 1);
+        assert_eq!(micros_u64(Duration::from_nanos(1_000)), 1);
+        assert_eq!(micros_u64(Duration::from_nanos(1_001)), 2);
     }
 
     #[test]
