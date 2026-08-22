@@ -25,7 +25,7 @@ use self::{
         DATASET_SCHEMA_VERSION, DATASET_SEED,
     },
     metrics::{collect_run_metadata, RunMetadata},
-    owned_temp::OwnedRunRoot,
+    owned_temp::{CleanupFailure, CleanupFailureState, OwnedRunRoot},
     protocol::{
         BenchmarkReport, CacheState, DatasetFingerprint, RunStatus, ScenarioRecord,
         ScenarioSamples, REPORT_SCHEMA_VERSION, SCENARIO_CONTRACT_VERSION,
@@ -51,6 +51,12 @@ enum HarnessCommand {
         candidate: PathBuf,
         output: PathBuf,
     },
+}
+
+struct CompletedRun {
+    metadata: RunMetadata,
+    dataset: DatasetFingerprint,
+    scenarios: Vec<ScenarioRecord>,
 }
 
 fn parse_command(args: &[String]) -> Result<HarnessCommand> {
@@ -403,36 +409,116 @@ fn execute_run_with_id(
 
     let mut scenarios = library_records;
     scenarios.extend(media_records);
-    let report = BenchmarkReport {
+    finish_run_with_cleanup(
+        report_path,
+        CompletedRun {
+            metadata,
+            dataset: dataset_fingerprint,
+            scenarios,
+        },
+        run,
+        keep_data,
+        OwnedRunRoot::cleanup,
+        OwnedRunRoot::retain,
+    )
+}
+
+fn finish_run_with_cleanup<Cleanup, Finish>(
+    report_path: &Path,
+    completed: CompletedRun,
+    run: OwnedRunRoot,
+    keep_data: bool,
+    cleanup: Cleanup,
+    finish: Finish,
+) -> Result<()>
+where
+    Cleanup: FnOnce(OwnedRunRoot) -> std::result::Result<(), CleanupFailure>,
+    Finish: FnOnce(OwnedRunRoot) -> PathBuf,
+{
+    let CompletedRun {
+        metadata,
+        dataset,
+        scenarios,
+    } = completed;
+    let passed_report = BenchmarkReport {
         schema_version: REPORT_SCHEMA_VERSION,
         scenario_contract_version: SCENARIO_CONTRACT_VERSION,
         git_commit: metadata.git_commit.clone(),
         generated_at_utc: metadata.generated_at_utc.clone(),
         environment: metadata.environment.clone(),
-        dataset: dataset_fingerprint.clone(),
+        dataset: dataset.clone(),
         scenarios: scenarios.clone(),
         run_status: RunStatus::Passed,
         errors: Vec::new(),
     };
-    if let Err(error) = report::write_benchmark_report(report_path, &report) {
+    if let Err(error) = report::write_benchmark_report(report_path, &passed_report) {
         let failed_report = failed_orchestration_report(
             metadata,
-            dataset_fingerprint,
+            dataset,
             scenarios,
             "write passed report",
             &error,
         );
-        return persist_failed_report_and_retain(report_path, failed_report, run, error);
+        return persist_failed_report_and_finish(report_path, failed_report, run, error, finish);
     }
     if keep_data {
-        let retained = run.retain();
+        let retained = finish(run);
         println!(
             "PureWall performance data retained at {}",
             retained.display()
         );
-        Ok(())
-    } else {
-        run.cleanup()
+        return Ok(());
+    }
+
+    match cleanup(run) {
+        Ok(()) => Ok(()),
+        Err(failure) => persist_cleanup_failure_report_and_finish(
+            report_path,
+            metadata,
+            dataset,
+            scenarios,
+            failure,
+            finish,
+        ),
+    }
+}
+
+fn persist_cleanup_failure_report_and_finish<Finish>(
+    report_path: &Path,
+    metadata: RunMetadata,
+    dataset: DatasetFingerprint,
+    scenarios: Vec<ScenarioRecord>,
+    failure: CleanupFailure,
+    finish: Finish,
+) -> Result<()>
+where
+    Finish: FnOnce(OwnedRunRoot) -> PathBuf,
+{
+    let (run, original, state) = failure.into_parts();
+    let original = original.context("cleanup owned performance run root");
+    let failed_report = failed_orchestration_report(
+        metadata,
+        dataset,
+        scenarios,
+        "cleanup owned run root",
+        &original,
+    );
+    let write_result = report::write_benchmark_report(report_path, &failed_report);
+    let retained = finish(run);
+    let retained_message = match state {
+        CleanupFailureState::BeforeRemoval => {
+            format!("performance data retained intact at {}", retained.display())
+        }
+        CleanupFailureState::RemovalMayBePartial => format!(
+            "remaining performance data may be partial at {}",
+            retained.display()
+        ),
+    };
+    match write_result {
+        Ok(()) => Err(original.context(retained_message)),
+        Err(write_error) => Err(original.context(format!(
+            "write failed performance report: {write_error:#}; {retained_message}"
+        ))),
     }
 }
 
@@ -984,6 +1070,84 @@ mod tests {
         assert!(output_path.with_extension("md").is_file());
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failures_replace_passed_output_with_failed_reports_and_retain_the_path() {
+        for (label, state, injected_error, retained_message) in [
+            (
+                "cleanup-validation-report",
+                owned_temp::CleanupFailureState::BeforeRemoval,
+                "injected cleanup safety validation failure",
+                "performance data retained intact at",
+            ),
+            (
+                "cleanup-removal-report",
+                owned_temp::CleanupFailureState::RemovalMayBePartial,
+                "injected remove_dir_all failure",
+                "remaining performance data may be partial at",
+            ),
+        ] {
+            let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let run_id = format!("{label}-{}-{sequence}", std::process::id());
+            let run = OwnedRunRoot::create_for_test(&run_id).unwrap();
+            let root_path = run.root().to_path_buf();
+            let report_directory = unique_runner_test_directory(label);
+            let report_path = report_directory.join("result.json");
+            report::preflight_benchmark_report_target(&report_path).unwrap();
+            let digest = "9".repeat(64);
+            let scenarios = protocol_test_report(&digest, 100, 100, 1_000).scenarios;
+            let dataset = DatasetFingerprint {
+                schema_version: DATASET_SCHEMA_VERSION,
+                seed: DATASET_SEED,
+                item_count: 120,
+                source_count: 2,
+                manifest_digest: Some(digest),
+            };
+
+            let error = finish_run_with_cleanup(
+                &report_path,
+                CompletedRun {
+                    metadata: test_run_metadata(),
+                    dataset,
+                    scenarios,
+                },
+                run,
+                false,
+                |run| {
+                    run.cleanup_with_test_operations(
+                        |owned| {
+                            if state == owned_temp::CleanupFailureState::BeforeRemoval {
+                                bail!(injected_error)
+                            }
+                            Ok(owned.root().to_path_buf())
+                        },
+                        |_| bail!(injected_error),
+                    )
+                },
+                |run| {
+                    let path = run.root().to_path_buf();
+                    run.cleanup().unwrap();
+                    path
+                },
+            )
+            .expect_err("cleanup failure must fail the run");
+
+            let error_chain = format!("{error:#}");
+            assert!(error_chain.contains(injected_error));
+            assert!(error_chain.contains(retained_message));
+            assert!(error_chain.contains(&root_path.display().to_string()));
+            let failed = report::read_benchmark_report(&report_path).unwrap();
+            assert_eq!(failed.run_status, RunStatus::Failed);
+            assert!(failed.errors[0].contains("cleanup owned run root"));
+            assert!(failed.errors[0].contains(injected_error));
+            let markdown = std::fs::read_to_string(report_path.with_extension("md")).unwrap();
+            assert!(markdown.contains("- Run status: Failed"));
+            assert!(markdown.contains(injected_error));
+            assert!(!root_path.exists());
+
+            std::fs::remove_dir_all(report_directory).unwrap();
+        }
     }
 
     #[test]

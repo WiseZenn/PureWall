@@ -177,6 +177,7 @@ fn benchmark_markdown(report: &BenchmarkReport) -> String {
     let mut markdown = format!(
         "# PureWall Performance Report\n\n\
          These results describe one recorded environment. They are not a universal Windows performance claim.\n\n\
+         - Run status: {:?}\n\n\
          ## Environment\n\n\
          - OS: {}\n\
          - Architecture: {}\n\
@@ -192,6 +193,7 @@ fn benchmark_markdown(report: &BenchmarkReport) -> String {
          ## Scenarios\n\n\
          | Scenario | Cache | Median | P95 | Peak working set | Status |\n\
          | --- | --- | ---: | ---: | ---: | --- |\n",
+        report.run_status,
         report.environment.os,
         report.environment.arch,
         report.environment.cpu,

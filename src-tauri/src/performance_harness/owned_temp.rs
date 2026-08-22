@@ -35,6 +35,25 @@ pub(crate) struct OwnedRunRoot {
     run_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CleanupFailureState {
+    BeforeRemoval,
+    RemovalMayBePartial,
+}
+
+#[derive(Debug)]
+pub(crate) struct CleanupFailure {
+    owned: OwnedRunRoot,
+    error: anyhow::Error,
+    state: CleanupFailureState,
+}
+
+impl CleanupFailure {
+    pub(crate) fn into_parts(self) -> (OwnedRunRoot, anyhow::Error, CleanupFailureState) {
+        (self.owned, self.error, self.state)
+    }
+}
+
 impl OwnedRunRoot {
     pub(crate) fn create(run_id: &str) -> Result<Self> {
         Self::create_under(&std::env::temp_dir(), run_id, run_id)
@@ -135,19 +154,67 @@ impl OwnedRunRoot {
         self.root.join("reports")
     }
 
-    pub(crate) fn cleanup(self) -> Result<()> {
-        let validated = validate_cleanup_target(
-            &self.temp_root,
-            &self.root,
-            &self.run_id,
-            inspect_root_no_follow,
-        )?;
-        fs::remove_dir_all(&validated).with_context(|| {
-            format!(
-                "remove validated performance run root {}",
-                validated.display()
-            )
-        })
+    pub(crate) fn cleanup(self) -> std::result::Result<(), CleanupFailure> {
+        self.cleanup_with(
+            |owned| {
+                validate_cleanup_target(
+                    &owned.temp_root,
+                    &owned.root,
+                    &owned.run_id,
+                    inspect_root_no_follow,
+                )
+            },
+            |validated| {
+                fs::remove_dir_all(validated).with_context(|| {
+                    format!(
+                        "remove validated performance run root {}",
+                        validated.display()
+                    )
+                })
+            },
+        )
+    }
+
+    fn cleanup_with<Validate, Remove>(
+        self,
+        validate: Validate,
+        remove: Remove,
+    ) -> std::result::Result<(), CleanupFailure>
+    where
+        Validate: FnOnce(&OwnedRunRoot) -> Result<PathBuf>,
+        Remove: FnOnce(&Path) -> Result<()>,
+    {
+        let validated = match validate(&self) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return Err(CleanupFailure {
+                    owned: self,
+                    error,
+                    state: CleanupFailureState::BeforeRemoval,
+                });
+            }
+        };
+        match remove(&validated) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(CleanupFailure {
+                owned: self,
+                error,
+                state: CleanupFailureState::RemovalMayBePartial,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_with_test_operations<Validate, Remove>(
+        self,
+        validate: Validate,
+        remove: Remove,
+    ) -> std::result::Result<(), CleanupFailure>
+    where
+        Validate: FnOnce(&OwnedRunRoot) -> Result<PathBuf>,
+        Remove: FnOnce(&Path) -> Result<()>,
+    {
+        self.cleanup_with(validate, remove)
     }
 
     pub(crate) fn retain(self) -> PathBuf {
@@ -610,6 +677,72 @@ mod tests {
         assert!(unmarked.exists());
         restore_marker(&unmarked, "unmarked-cleanup");
         remove_validated_test_root(&unmarked, "unmarked-cleanup");
+    }
+
+    #[test]
+    fn cleanup_validation_failure_returns_the_untouched_owned_root() {
+        let owned = OwnedRunRoot::create_for_test("cleanup-validation-failure").unwrap();
+        let root = owned.root().to_path_buf();
+
+        let failure = owned
+            .cleanup_with(
+                |_| bail!("injected cleanup validation failure"),
+                |_| panic!("remove must not run after validation failure"),
+            )
+            .expect_err("validation failure must return ownership");
+        let (owned, error, state) = failure.into_parts();
+
+        assert_eq!(state, CleanupFailureState::BeforeRemoval);
+        assert!(format!("{error:#}").contains("injected cleanup validation failure"));
+        assert_eq!(owned.root(), root);
+        assert!(root.exists());
+        owned.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cleanup_removal_failure_returns_the_owned_root_as_possibly_partial() {
+        let owned = OwnedRunRoot::create_for_test("cleanup-removal-failure").unwrap();
+        let root = owned.root().to_path_buf();
+
+        let failure = owned
+            .cleanup_with(
+                |owned| Ok(owned.root().to_path_buf()),
+                |_| bail!("injected remove_dir_all failure"),
+            )
+            .expect_err("removal failure must return ownership");
+        let (owned, error, state) = failure.into_parts();
+
+        assert_eq!(state, CleanupFailureState::RemovalMayBePartial);
+        assert!(format!("{error:#}").contains("injected remove_dir_all failure"));
+        assert_eq!(owned.root(), root);
+        assert!(root.exists());
+        owned.cleanup().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_returns_ownership_after_remove_dir_all_actually_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let owned = OwnedRunRoot::create_for_test("cleanup-real-removal-failure").unwrap();
+        let root = owned.root().to_path_buf();
+        let marker_lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(root.join(MARKER_FILE_NAME))
+            .unwrap();
+
+        let failure = owned
+            .cleanup()
+            .expect_err("the marker's no-delete share mode must make remove_dir_all fail");
+        let (owned, error, state) = failure.into_parts();
+
+        assert_eq!(state, CleanupFailureState::RemovalMayBePartial);
+        assert!(format!("{error:#}").contains("remove validated performance run root"));
+        assert_eq!(owned.root(), root);
+        assert!(root.exists());
+        drop(marker_lock);
+        owned.cleanup().unwrap();
     }
 
     #[test]
