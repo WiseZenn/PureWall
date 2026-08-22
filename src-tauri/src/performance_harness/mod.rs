@@ -335,25 +335,22 @@ fn execute_run_with_id(
     run_id: &str,
 ) -> Result<()> {
     let policy = sample_policy(scale);
-    let metadata = collect_run_metadata(policy)?;
-    let run = match OwnedRunRoot::create(run_id) {
-        Ok(run) => run,
-        Err(error) => {
-            let report = failed_pre_generation_report(
-                metadata,
-                scale,
-                format!("performance run-root preflight failed: {error:#}"),
-            );
-            report::write_benchmark_report(report_path, &report)?;
-            return Err(error);
-        }
-    };
+    let (metadata, run) = initialize_run(
+        scale,
+        report_path,
+        run_id,
+        || collect_run_metadata(policy),
+        OwnedRunRoot::create,
+    )?;
     if let Err(error) = validate_report_outside_owned_root(report_path, &run) {
-        let retained = run.retain();
-        return Err(error.context(format!(
-            "performance data retained at {}",
-            retained.display()
-        )));
+        return fail_owned_run_before_generation(
+            report_path,
+            metadata,
+            scale,
+            run,
+            "report target validation",
+            error,
+        );
     }
 
     let dataset =
@@ -409,20 +406,23 @@ fn execute_run_with_id(
     let report = BenchmarkReport {
         schema_version: REPORT_SCHEMA_VERSION,
         scenario_contract_version: SCENARIO_CONTRACT_VERSION,
-        git_commit: metadata.git_commit,
-        generated_at_utc: metadata.generated_at_utc,
-        environment: metadata.environment,
-        dataset: dataset_fingerprint,
-        scenarios,
+        git_commit: metadata.git_commit.clone(),
+        generated_at_utc: metadata.generated_at_utc.clone(),
+        environment: metadata.environment.clone(),
+        dataset: dataset_fingerprint.clone(),
+        scenarios: scenarios.clone(),
         run_status: RunStatus::Passed,
         errors: Vec::new(),
     };
     if let Err(error) = report::write_benchmark_report(report_path, &report) {
-        let retained = run.retain();
-        return Err(error.context(format!(
-            "performance data retained at {}",
-            retained.display()
-        )));
+        let failed_report = failed_orchestration_report(
+            metadata,
+            dataset_fingerprint,
+            scenarios,
+            "write passed report",
+            &error,
+        );
+        return persist_failed_report_and_retain(report_path, failed_report, run, error);
     }
     if keep_data {
         let retained = run.retain();
@@ -434,6 +434,113 @@ fn execute_run_with_id(
     } else {
         run.cleanup()
     }
+}
+
+fn initialize_run<MetadataCollector, RootFactory>(
+    scale: DatasetScale,
+    report_path: &Path,
+    run_id: &str,
+    mut collect_metadata: MetadataCollector,
+    create_root: RootFactory,
+) -> Result<(RunMetadata, OwnedRunRoot)>
+where
+    MetadataCollector: FnMut() -> Result<RunMetadata>,
+    RootFactory: FnOnce(&str) -> Result<OwnedRunRoot>,
+{
+    report::preflight_benchmark_report_target(report_path).with_context(|| {
+        format!(
+            "cannot write performance report {}; owned data root was not created",
+            report_path.display()
+        )
+    })?;
+
+    let metadata = match collect_metadata() {
+        Ok(metadata) => metadata,
+        Err(original) => {
+            let report_metadata = match collect_metadata() {
+                Ok(metadata) => metadata,
+                Err(report_metadata_error) => {
+                    return Err(original.context(format!(
+                        "cannot write failed performance report because truthful metadata collection also failed: {report_metadata_error:#}; owned data root was not created"
+                    )));
+                }
+            };
+            let report = failed_pre_generation_report(
+                report_metadata,
+                scale,
+                format!("performance metadata collection failed: {original:#}"),
+            );
+            return persist_failed_report_before_root(report_path, report, original);
+        }
+    };
+
+    match create_root(run_id) {
+        Ok(run) => Ok((metadata, run)),
+        Err(original) => {
+            let report = failed_pre_generation_report(
+                metadata,
+                scale,
+                format!("performance run-root preflight failed: {original:#}"),
+            );
+            persist_failed_report_before_root(report_path, report, original)
+        }
+    }
+}
+
+fn persist_failed_report_before_root<T>(
+    report_path: &Path,
+    report: BenchmarkReport,
+    original: anyhow::Error,
+) -> Result<T> {
+    match report::write_benchmark_report(report_path, &report) {
+        Ok(()) => Err(original.context(format!(
+            "failed performance report written to {}; owned data root was not created",
+            report_path.display()
+        ))),
+        Err(write_error) => Err(original.context(format!(
+            "cannot write failed performance report {}: {write_error:#}; owned data root was not created",
+            report_path.display()
+        ))),
+    }
+}
+
+fn fail_owned_run_before_generation(
+    report_path: &Path,
+    metadata: RunMetadata,
+    scale: DatasetScale,
+    run: OwnedRunRoot,
+    operation: &str,
+    original: anyhow::Error,
+) -> Result<()> {
+    fail_owned_run_before_generation_with(
+        report_path,
+        metadata,
+        scale,
+        run,
+        operation,
+        original,
+        OwnedRunRoot::retain,
+    )
+}
+
+fn fail_owned_run_before_generation_with<Finish>(
+    report_path: &Path,
+    metadata: RunMetadata,
+    scale: DatasetScale,
+    run: OwnedRunRoot,
+    operation: &str,
+    original: anyhow::Error,
+    finish: Finish,
+) -> Result<()>
+where
+    Finish: FnOnce(OwnedRunRoot) -> PathBuf,
+{
+    let report = failed_pre_generation_report(
+        metadata,
+        scale,
+        format!("performance {operation} failed: {original:#}"),
+    );
+    persist_failed_report_and_finish(report_path, report, run, original, finish)
 }
 
 fn sample_policy(scale: DatasetScale) -> SamplePolicy {
@@ -475,8 +582,21 @@ fn persist_failed_report_and_retain(
     run: OwnedRunRoot,
     original: anyhow::Error,
 ) -> Result<()> {
+    persist_failed_report_and_finish(report_path, report, run, original, OwnedRunRoot::retain)
+}
+
+fn persist_failed_report_and_finish<Finish>(
+    report_path: &Path,
+    report: BenchmarkReport,
+    run: OwnedRunRoot,
+    original: anyhow::Error,
+    finish: Finish,
+) -> Result<()>
+where
+    Finish: FnOnce(OwnedRunRoot) -> PathBuf,
+{
     let write_result = report::write_benchmark_report(report_path, &report);
-    let retained = run.retain();
+    let retained = finish(run);
     match write_result {
         Ok(()) => Err(original.context(format!(
             "performance data retained at {}",
@@ -493,6 +613,7 @@ fn persist_failed_report_and_retain(
 mod tests {
     use super::*;
     use std::{
+        cell::Cell,
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
@@ -504,6 +625,15 @@ mod tests {
     };
 
     static RUNNER_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_runner_test_directory(label: &str) -> PathBuf {
+        let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir()
+            .join("purewall-performance-runner-tests")
+            .join(format!("{label}-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("create runner test directory");
+        directory
+    }
 
     fn test_run_metadata() -> RunMetadata {
         RunMetadata {
@@ -645,6 +775,124 @@ mod tests {
         );
         assert!(report.scenarios.is_empty());
         assert_eq!(report.errors, vec!["dataset preflight failed"]);
+    }
+
+    #[test]
+    fn invalid_report_target_is_rejected_before_metadata_or_root_creation() {
+        let directory = unique_runner_test_directory("invalid-report-target");
+        let invalid_target = directory.join("target.json");
+        std::fs::create_dir(&invalid_target).unwrap();
+        let metadata_calls = Cell::new(0);
+        let root_calls = Cell::new(0);
+
+        let error = initialize_run(
+            DatasetScale::Ci,
+            &invalid_target,
+            "invalid-report-target",
+            || {
+                metadata_calls.set(metadata_calls.get() + 1);
+                Ok(test_run_metadata())
+            },
+            |_| {
+                root_calls.set(root_calls.get() + 1);
+                bail!("root creation must not be reached")
+            },
+        )
+        .expect_err("directory report target must fail before creating a root");
+
+        assert!(format!("{error:#}").contains("report target"));
+        assert_eq!(metadata_calls.get(), 0);
+        assert_eq!(root_calls.get(), 0);
+        assert!(!std::env::temp_dir()
+            .join("purewall-performance")
+            .join("invalid-report-target")
+            .exists());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn metadata_failure_writes_failed_report_without_creating_a_root() {
+        let directory = unique_runner_test_directory("metadata-failure");
+        let report_path = directory.join("failed.json");
+        let metadata_calls = Cell::new(0);
+        let root_calls = Cell::new(0);
+
+        let error = initialize_run(
+            DatasetScale::Ci,
+            &report_path,
+            "metadata-failure",
+            || {
+                let call = metadata_calls.get();
+                metadata_calls.set(call + 1);
+                if call == 0 {
+                    bail!("injected primary metadata failure")
+                }
+                Ok(test_run_metadata())
+            },
+            |_| {
+                root_calls.set(root_calls.get() + 1);
+                bail!("root creation must not be reached")
+            },
+        )
+        .expect_err("metadata collection must stop initialization");
+
+        assert!(format!("{error:#}").contains("injected primary metadata failure"));
+        assert_eq!(metadata_calls.get(), 2);
+        assert_eq!(root_calls.get(), 0);
+        let failed = report::read_benchmark_report(&report_path).unwrap();
+        assert_eq!(failed.run_status, RunStatus::Failed);
+        assert!(failed.scenarios.is_empty());
+        assert!(failed.dataset.manifest_digest.is_none());
+        assert!(failed.errors[0].contains("metadata collection failed"));
+        assert!(failed.errors[0].contains("injected primary metadata failure"));
+        assert!(report_path.with_extension("md").is_file());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn owned_root_overlap_writes_failed_report_and_preserves_original_error() {
+        let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("task7-overlap-{}-{sequence}", std::process::id());
+        let run = OwnedRunRoot::create_for_test(&run_id).unwrap();
+        let root_path = run.root().to_path_buf();
+        let report_path = root_path
+            .parent()
+            .unwrap()
+            .join(format!("{run_id}-overlap.json"));
+        report::preflight_benchmark_report_target(&report_path).unwrap();
+        let original = validate_report_outside_owned_root(&report_path, &run)
+            .expect_err("owned root ancestor must overlap");
+
+        let error = fail_owned_run_before_generation_with(
+            &report_path,
+            test_run_metadata(),
+            DatasetScale::Ci,
+            run,
+            "report target validation",
+            original,
+            |run| {
+                let path = run.root().to_path_buf();
+                run.cleanup().unwrap();
+                path
+            },
+        )
+        .expect_err("overlap must stop the run");
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("outside the owned temporary data root"));
+        assert!(error_chain.contains("performance data retained at"));
+        let failed = report::read_benchmark_report(&report_path).unwrap();
+        assert_eq!(failed.run_status, RunStatus::Failed);
+        assert!(failed.scenarios.is_empty());
+        assert!(failed.dataset.manifest_digest.is_none());
+        assert!(failed.errors[0].contains("report target validation"));
+        assert!(failed.errors[0].contains("outside the owned temporary data root"));
+        assert!(!root_path.exists());
+
+        std::fs::remove_file(report_path.with_extension("md")).unwrap();
+        std::fs::remove_file(report_path).unwrap();
     }
 
     #[test]

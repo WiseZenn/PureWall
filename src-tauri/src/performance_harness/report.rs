@@ -7,9 +7,16 @@ use std::{
 use anyhow::{bail, Context, Result};
 
 use super::compare::ComparisonReport;
+use super::dataset::DATASET_SCHEMA_VERSION;
 use super::protocol::{
     BenchmarkReport, RunStatus, REPORT_SCHEMA_VERSION, SCENARIO_CONTRACT_VERSION,
 };
+
+pub(crate) fn preflight_benchmark_report_target(path: &Path) -> Result<()> {
+    validate_json_target(path)?;
+    preflight_atomic_target(&path.with_extension("md"))?;
+    preflight_atomic_target(path)
+}
 
 pub(crate) fn write_benchmark_report(path: &Path, report: &BenchmarkReport) -> Result<()> {
     validate_json_target(path)?;
@@ -38,6 +45,9 @@ pub(crate) fn write_comparison_report(path: &Path, report: &ComparisonReport) ->
 }
 
 fn validate_json_target(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("report target must be absolute: {}", path.display());
+    }
     if path.is_dir() {
         bail!("report target must not be a directory: {}", path.display());
     }
@@ -48,6 +58,44 @@ fn validate_json_target(path: &Path) -> Result<()> {
         bail!("report parent directory does not exist");
     }
     Ok(())
+}
+
+fn preflight_atomic_target(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        bail!("report target must not be a directory: {}", path.display());
+    }
+    if path.exists() {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("report target is not writable: {}", path.display()))?;
+        drop(file);
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("report target must have a UTF-8 file name")?;
+    let temporary = path.with_file_name(format!("{file_name}.tmp"));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("report target is not writable: {}", path.display()))?;
+    let sync_result = file
+        .sync_all()
+        .with_context(|| format!("sync report preflight probe {}", temporary.display()));
+    drop(file);
+    let cleanup_result = fs::remove_file(&temporary)
+        .with_context(|| format!("remove report preflight probe {}", temporary.display()));
+    match (sync_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(sync_error), Ok(())) => Err(sync_error),
+        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(sync_error), Err(cleanup_error)) => Err(sync_error.context(format!(
+            "also failed to remove report preflight probe: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn write_atomic_text(path: &Path, contents: &str) -> Result<()> {
@@ -91,6 +139,12 @@ fn validate_benchmark_report(report: &BenchmarkReport) -> Result<()> {
             report.scenario_contract_version
         );
     }
+    if report.dataset.schema_version != DATASET_SCHEMA_VERSION {
+        bail!(
+            "unsupported dataset schema version {}",
+            report.dataset.schema_version
+        );
+    }
     if !is_hex(&report.git_commit, 40) {
         bail!("benchmark report git_commit must be 40 hexadecimal characters");
     }
@@ -99,7 +153,7 @@ fn validate_benchmark_report(report: &BenchmarkReport) -> Result<()> {
     }
     match report.dataset.manifest_digest.as_deref() {
         Some(digest) if is_hex(digest, 64) => {}
-        None if report.run_status == RunStatus::Failed => {}
+        None if report.run_status == RunStatus::Failed && report.scenarios.is_empty() => {}
         _ => bail!("benchmark report manifest_digest must be 64 hexadecimal characters"),
     }
     if report.run_status == RunStatus::Failed
@@ -246,6 +300,7 @@ mod tests {
 
     use crate::performance_harness::{
         compare::compare_reports,
+        dataset::DATASET_SCHEMA_VERSION,
         protocol::{protocol_test_report, RunStatus, REPORT_SCHEMA_VERSION},
     };
 
@@ -319,6 +374,39 @@ mod tests {
             .push("generation failed".into());
         fs::write(&json, serde_json::to_vec(&failed_pre_generation).unwrap()).unwrap();
         assert_eq!(read_benchmark_report(&json).unwrap(), failed_pre_generation);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reader_rejects_unknown_dataset_schema_version() {
+        let directory = unique_report_test_directory("dataset-schema-validation");
+        let json = directory.join("report.json");
+        let digest = "e".repeat(64);
+        let mut report = protocol_test_report(&digest, 100, 100, 1_000);
+        report.dataset.schema_version = DATASET_SCHEMA_VERSION + 1;
+        fs::write(&json, serde_json::to_vec(&report).unwrap()).unwrap();
+
+        let error = read_benchmark_report(&json).expect_err("dataset schema 2 must be rejected");
+        assert!(error.to_string().contains("dataset schema version"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reader_rejects_null_manifest_digest_after_any_scenario_was_recorded() {
+        let directory = unique_report_test_directory("failed-scenario-null-digest");
+        let json = directory.join("report.json");
+        let digest = "f".repeat(64);
+        let mut report = protocol_test_report(&digest, 100, 100, 1_000);
+        report.run_status = RunStatus::Failed;
+        report.dataset.manifest_digest = None;
+        report.errors.push("scenario failed".into());
+        fs::write(&json, serde_json::to_vec(&report).unwrap()).unwrap();
+
+        let error = read_benchmark_report(&json)
+            .expect_err("a failed report with scenarios still requires a digest");
+        assert!(error.to_string().contains("manifest_digest"));
 
         fs::remove_dir_all(directory).unwrap();
     }
