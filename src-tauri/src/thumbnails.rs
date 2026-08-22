@@ -57,6 +57,13 @@ impl ThumbnailCache {
         Ok(Self { cache_dir })
     }
 
+    #[cfg(feature = "performance-harness")]
+    pub(crate) fn performance_config_descriptor() -> String {
+        format!(
+            "derivatives:thumbnail={THUMBNAIL_CACHE_PROFILE},{THUMBNAIL_MAX_DIMENSION},{THUMBNAIL_JPEG_QUALITY};preview={PREVIEW_CACHE_PROFILE},{PREVIEW_MAX_DIMENSION},{PREVIEW_JPEG_QUALITY}"
+        )
+    }
+
     fn cache_identity(path: &str, profile: &str) -> String {
         let mut input = format!("{}|{}", profile, path);
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -441,6 +448,17 @@ pub(crate) fn write_derivative_atomic(cache_path: &Path, bytes: &[u8]) -> std::i
 mod tests {
     use super::*;
     use image::GenericImageView;
+
+    #[cfg(feature = "performance-harness")]
+    #[test]
+    fn performance_descriptor_uses_the_production_derivative_constants() {
+        assert_eq!(
+            ThumbnailCache::performance_config_descriptor(),
+            format!(
+                "derivatives:thumbnail={THUMBNAIL_CACHE_PROFILE},{THUMBNAIL_MAX_DIMENSION},{THUMBNAIL_JPEG_QUALITY};preview={PREVIEW_CACHE_PROFILE},{PREVIEW_MAX_DIMENSION},{PREVIEW_JPEG_QUALITY}"
+            )
+        );
+    }
 
     fn unique_temp_image_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
