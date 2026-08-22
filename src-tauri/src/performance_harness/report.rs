@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, Metadata, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -52,6 +52,8 @@ fn publish_report_pair(path: &Path, json: &str, markdown: &str) -> Result<()> {
     let publication_marker = begin_publication(path)?;
     write_atomic_text(path, json)?;
     write_atomic_text(&path.with_extension("md"), markdown)?;
+    let marker_file = open_owned_publication_marker(&publication_marker, false)?;
+    drop(marker_file);
     fs::remove_file(&publication_marker).with_context(|| {
         format!(
             "remove report publication marker {}",
@@ -72,21 +74,13 @@ fn preflight_publication_marker(path: &Path) -> Result<()> {
     let marker = publication_marker_path(path)?;
     match fs::symlink_metadata(&marker) {
         Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                bail!(
-                    "report publication marker must be a regular file: {}",
+            validate_publication_marker_metadata(&marker, &metadata)?;
+            let file = open_owned_publication_marker(&marker, true).with_context(|| {
+                format!(
+                    "report publication marker is not writable: {}",
                     marker.display()
-                );
-            }
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&marker)
-                .with_context(|| {
-                    format!(
-                        "report publication marker is not writable: {}",
-                        marker.display()
-                    )
-                })?;
+                )
+            })?;
             file.sync_all()
                 .with_context(|| format!("sync report publication marker {}", marker.display()))
         }
@@ -100,11 +94,10 @@ fn preflight_publication_marker(path: &Path) -> Result<()> {
 
 fn begin_publication(path: &Path) -> Result<std::path::PathBuf> {
     let marker = publication_marker_path(path)?;
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-    {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    configure_publication_marker_open(&mut options);
+    let mut file = match options.open(&marker) {
         Ok(file) => {
             file.set_len(0).with_context(|| {
                 format!("initialize report publication marker {}", marker.display())
@@ -112,19 +105,15 @@ fn begin_publication(path: &Path) -> Result<std::path::PathBuf> {
             file
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&marker).with_context(|| {
-                format!("inspect report publication marker {}", marker.display())
-            })?;
-            if !metadata.file_type().is_file() {
-                bail!(
-                    "report publication marker must be a regular file: {}",
+            let file = open_owned_publication_marker(&marker, true)?;
+            file.sync_all().with_context(|| {
+                format!(
+                    "sync existing report publication marker {}",
                     marker.display()
-                );
-            }
-            OpenOptions::new()
-                .write(true)
-                .open(&marker)
-                .with_context(|| format!("open report publication marker {}", marker.display()))?
+                )
+            })?;
+            drop(file);
+            return Ok(marker);
         }
         Err(error) => {
             return Err(error)
@@ -137,6 +126,87 @@ fn begin_publication(path: &Path) -> Result<std::path::PathBuf> {
         .with_context(|| format!("sync report publication marker {}", marker.display()))?;
     drop(file);
     Ok(marker)
+}
+
+fn open_owned_publication_marker(path: &Path, writable: bool) -> Result<File> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect report publication marker {}", path.display()))?;
+    validate_publication_marker_metadata(path, &metadata)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable);
+    configure_publication_marker_open(&mut options);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open report publication marker {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("inspect open report publication marker {}", path.display()))?;
+    validate_publication_marker_metadata(path, &opened_metadata)?;
+    validate_publication_marker_contents(path, &mut file)?;
+    Ok(file)
+}
+
+fn validate_publication_marker_metadata(path: &Path, metadata: &Metadata) -> Result<()> {
+    if !metadata.file_type().is_file() {
+        bail!(
+            "report publication marker must be a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            bail!(
+                "report publication marker must not be a reparse point: {}",
+                path.display()
+            );
+        }
+    }
+    if metadata.len() != PUBLICATION_MARKER_CONTENTS.len() as u64 {
+        bail!(
+            "report publication marker is not owned by PureWall: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_publication_marker_contents(path: &Path, file: &mut File) -> Result<()> {
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seek report publication marker {}", path.display()))?;
+    let mut contents = vec![0_u8; PUBLICATION_MARKER_CONTENTS.len()];
+    file.read_exact(&mut contents)
+        .with_context(|| format!("read report publication marker {}", path.display()))?;
+    let mut trailing = [0_u8; 1];
+    let trailing_length = file
+        .read(&mut trailing)
+        .with_context(|| format!("read report publication marker {}", path.display()))?;
+    if contents != PUBLICATION_MARKER_CONTENTS || trailing_length != 0 {
+        bail!(
+            "report publication marker is not owned by PureWall: {}",
+            path.display()
+        );
+    }
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind report publication marker {}", path.display()))?;
+    Ok(())
+}
+
+fn configure_publication_marker_open(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
 }
 
 fn ensure_publication_complete(path: &Path) -> Result<()> {
@@ -434,7 +504,10 @@ mod tests {
         protocol::{protocol_test_report, RunStatus, REPORT_SCHEMA_VERSION},
     };
 
-    use super::{read_benchmark_report, write_benchmark_report, write_comparison_report};
+    use super::{
+        preflight_benchmark_report_target, read_benchmark_report, write_benchmark_report,
+        write_comparison_report, PUBLICATION_MARKER_CONTENTS,
+    };
 
     static REPORT_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -586,6 +659,44 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn preflight_rejects_foreign_publication_marker_without_mutating_it() {
+        let directory = unique_report_test_directory("foreign-marker-preflight");
+        let json = directory.join("report.json");
+        let publication_marker = directory.join("report.json.publishing");
+        let foreign_contents = vec![b'X'; PUBLICATION_MARKER_CONTENTS.len()];
+        fs::write(&publication_marker, &foreign_contents).unwrap();
+
+        let error = preflight_benchmark_report_target(&json)
+            .expect_err("a foreign publication marker must fail preflight");
+        assert!(format!("{error:#}").contains("publication marker"));
+        assert_eq!(fs::read(&publication_marker).unwrap(), foreign_contents);
+        assert!(!json.exists());
+        assert!(!directory.join("report.md").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn writer_rejects_foreign_publication_marker_without_mutating_it() {
+        let directory = unique_report_test_directory("foreign-marker-write");
+        let json = directory.join("report.json");
+        let publication_marker = directory.join("report.json.publishing");
+        let foreign_contents = vec![b'Y'; PUBLICATION_MARKER_CONTENTS.len()];
+        fs::write(&publication_marker, &foreign_contents).unwrap();
+        let digest = "6".repeat(64);
+        let report = protocol_test_report(&digest, 100, 100, 1_000);
+
+        let error = write_benchmark_report(&json, &report)
+            .expect_err("a foreign publication marker must block publication");
+        assert!(format!("{error:#}").contains("publication marker"));
+        assert_eq!(fs::read(&publication_marker).unwrap(), foreign_contents);
+        assert!(!json.exists());
+        assert!(!directory.join("report.md").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn interrupted_second_artifact_publication_blocks_reads_until_retry_completes() {
@@ -639,7 +750,7 @@ mod tests {
         let digest = "7".repeat(64);
         let passed = protocol_test_report(&digest, 100, 100, 1_000);
         write_benchmark_report(&json, &passed).unwrap();
-        fs::write(&publication_marker, b"publication incomplete\n").unwrap();
+        fs::write(&publication_marker, PUBLICATION_MARKER_CONTENTS).unwrap();
         let marker_lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0x1 | 0x2)
