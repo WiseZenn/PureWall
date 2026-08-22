@@ -9,6 +9,13 @@ indexes user-selected local image folders, stores library metadata in SQLite, ge
 app-owned image derivatives, and applies wallpapers through Windows APIs. The original
 wallpaper files remain in their source locations.
 
+Performance measurement is a separate, contributor-only entry path. The Rust harness is
+compiled only with the `performance-harness` Cargo feature and consumes an explicit
+`--performance-harness` marker before Tauri setup. Harness execution therefore never
+initializes the GUI, watcher, tray, wallpaper integration, production AppData, or a real
+library; it uses only marker-owned synthetic temporary roots. See
+[PERFORMANCE.md](PERFORMANCE.md) for the run, comparison, and cleanup contract.
+
 The primary flow is:
 ```text
 import or watched-folder change

@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test:unit": "vitest run --exclude scripts/qa-screenshots.test.mjs",
+    "test:performance-harness": "cargo test --manifest-path src-tauri/Cargo.toml --features performance-harness performance_harness -- --nocapture",
     "test:release-contract": "node scripts/verify-release-contract.mjs --self-test",
     "qa:screenshots": "npm run build && node scripts/qa-screenshots.mjs && node --test scripts/qa-screenshots.test.mjs",
     "verify:release": "node scripts/verify-release-contract.mjs"

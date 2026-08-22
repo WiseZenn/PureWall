@@ -46,6 +46,17 @@ Phase 6 is complete. The implementation extracted focused responsibilities witho
 
 Phase 6 remains a completed maintainability milestone, not a broad rewrite. Existing local-library, database, playback, and Windows safety contracts remain the compatibility baseline.
 
+## Phase 7A: evidence-led large-library performance — active
+
+Phase 7A is building an isolated, repeatable performance evidence loop before changing production behavior:
+
+- A feature-gated pre-Tauri harness uses deterministic synthetic data and production scanner, database, playback-selection, thumbnail, preview, and queue paths without touching PureWall AppData or a real wallpaper library.
+- Windows CI runs only the 120-item contract fixture. The local Standard scale is 10,000 items in one root; Stress is 100,000 items across ten roots and requires a separate explicit opt-in.
+- Reports preserve raw samples, median/P95, peak working set, correctness evidence, environment and dataset fingerprints, and fail-closed comparison results.
+- The next evidence step is an untouched Standard baseline and hotspot ranking. No production optimization or successful Stress run is claimed yet.
+
+See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the contributor workflow and safety boundary.
+
 ## Explicitly deferred
 
 - **PureWall-X** is a later product built after the ordinary PureWall foundation and release loop are complete. Online feeds, recommendation services, or PureWall-X-only behavior do not belong in current PureWall feature requests.

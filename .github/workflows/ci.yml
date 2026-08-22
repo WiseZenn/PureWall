@@ -47,6 +47,9 @@ jobs:
       - run: cargo test
         working-directory: src-tauri
 
+      - name: Verify performance harness contract (small synthetic fixture only)
+        run: npm run test:performance-harness
+
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: src-tauri
 
