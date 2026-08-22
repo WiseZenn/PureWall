@@ -12,36 +12,144 @@ use super::protocol::{
     BenchmarkReport, RunStatus, REPORT_SCHEMA_VERSION, SCENARIO_CONTRACT_VERSION,
 };
 
+const PUBLICATION_MARKER_SUFFIX: &str = ".publishing";
+const PUBLICATION_MARKER_CONTENTS: &[u8] = b"PureWall report publication is incomplete\n";
+
 pub(crate) fn preflight_benchmark_report_target(path: &Path) -> Result<()> {
     validate_json_target(path)?;
-    preflight_atomic_target(&path.with_extension("md"))?;
-    preflight_atomic_target(path)
+    preflight_publication_marker(path)?;
+    preflight_atomic_target(path)?;
+    preflight_atomic_target(&path.with_extension("md"))
 }
 
 pub(crate) fn write_benchmark_report(path: &Path, report: &BenchmarkReport) -> Result<()> {
     validate_json_target(path)?;
-    let markdown_path = path.with_extension("md");
-    write_atomic_text(&markdown_path, &benchmark_markdown(report))?;
     let mut json = serde_json::to_string_pretty(report).context("serialize benchmark report")?;
     json.push('\n');
-    write_atomic_text(path, &json)
+    publish_report_pair(path, &json, &benchmark_markdown(report))
 }
 
 pub(crate) fn read_benchmark_report(path: &Path) -> Result<BenchmarkReport> {
+    ensure_publication_complete(path)?;
     let bytes =
         fs::read(path).with_context(|| format!("read benchmark report {}", path.display()))?;
+    ensure_publication_complete(path)?;
     let report: BenchmarkReport =
         serde_json::from_slice(&bytes).context("parse benchmark report JSON")?;
     validate_benchmark_report(&report)?;
+    ensure_publication_complete(path)?;
     Ok(report)
 }
 
 pub(crate) fn write_comparison_report(path: &Path, report: &ComparisonReport) -> Result<()> {
     validate_json_target(path)?;
-    write_atomic_text(&path.with_extension("md"), &comparison_markdown(report))?;
     let mut json = serde_json::to_string_pretty(report).context("serialize comparison report")?;
     json.push('\n');
-    write_atomic_text(path, &json)
+    publish_report_pair(path, &json, &comparison_markdown(report))
+}
+
+fn publish_report_pair(path: &Path, json: &str, markdown: &str) -> Result<()> {
+    let publication_marker = begin_publication(path)?;
+    write_atomic_text(path, json)?;
+    write_atomic_text(&path.with_extension("md"), markdown)?;
+    fs::remove_file(&publication_marker).with_context(|| {
+        format!(
+            "remove report publication marker {}",
+            publication_marker.display()
+        )
+    })
+}
+
+fn publication_marker_path(path: &Path) -> Result<std::path::PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("report target must have a UTF-8 file name")?;
+    Ok(path.with_file_name(format!("{file_name}{PUBLICATION_MARKER_SUFFIX}")))
+}
+
+fn preflight_publication_marker(path: &Path) -> Result<()> {
+    let marker = publication_marker_path(path)?;
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "report publication marker must be a regular file: {}",
+                    marker.display()
+                );
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&marker)
+                .with_context(|| {
+                    format!(
+                        "report publication marker is not writable: {}",
+                        marker.display()
+                    )
+                })?;
+            file.sync_all()
+                .with_context(|| format!("sync report publication marker {}", marker.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            preflight_atomic_target(&marker)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect report publication marker {}", marker.display())),
+    }
+}
+
+fn begin_publication(path: &Path) -> Result<std::path::PathBuf> {
+    let marker = publication_marker_path(path)?;
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(file) => {
+            file.set_len(0).with_context(|| {
+                format!("initialize report publication marker {}", marker.display())
+            })?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&marker).with_context(|| {
+                format!("inspect report publication marker {}", marker.display())
+            })?;
+            if !metadata.file_type().is_file() {
+                bail!(
+                    "report publication marker must be a regular file: {}",
+                    marker.display()
+                );
+            }
+            OpenOptions::new()
+                .write(true)
+                .open(&marker)
+                .with_context(|| format!("open report publication marker {}", marker.display()))?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("create report publication marker {}", marker.display()));
+        }
+    };
+    file.write_all(PUBLICATION_MARKER_CONTENTS)
+        .with_context(|| format!("write report publication marker {}", marker.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync report publication marker {}", marker.display()))?;
+    drop(file);
+    Ok(marker)
+}
+
+fn ensure_publication_complete(path: &Path) -> Result<()> {
+    let marker = publication_marker_path(path)?;
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => bail!(
+            "report publication is incomplete while marker exists: {}",
+            marker.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect report publication marker {}", marker.display())),
+    }
 }
 
 fn validate_json_target(path: &Path) -> Result<()> {
@@ -112,18 +220,38 @@ fn write_atomic_text(path: &Path, contents: &str) -> Result<()> {
         .create_new(true)
         .open(&temporary)
         .with_context(|| format!("create temporary report {}", temporary.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("write temporary report {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync temporary report {}", temporary.display()))?;
+    let write_result = file
+        .write_all(contents.as_bytes())
+        .with_context(|| format!("write temporary report {}", temporary.display()))
+        .and_then(|()| {
+            file.sync_all()
+                .with_context(|| format!("sync temporary report {}", temporary.display()))
+        });
     drop(file);
-    fs::rename(&temporary, path).with_context(|| {
+    if let Err(error) = write_result {
+        return Err(cleanup_owned_temporary_after_error(&temporary, error));
+    }
+    if let Err(error) = fs::rename(&temporary, path).with_context(|| {
         format!(
             "publish temporary report {} to {}",
             temporary.display(),
             path.display()
         )
-    })
+    }) {
+        return Err(cleanup_owned_temporary_after_error(&temporary, error));
+    }
+    Ok(())
+}
+
+fn cleanup_owned_temporary_after_error(temporary: &Path, error: anyhow::Error) -> anyhow::Error {
+    match fs::remove_file(temporary) {
+        Ok(()) => error,
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup_error) => error.context(format!(
+            "also failed to remove owned temporary report {}: {cleanup_error}",
+            temporary.display()
+        )),
+    }
 }
 
 fn validate_benchmark_report(report: &BenchmarkReport) -> Result<()> {
@@ -454,6 +582,83 @@ mod tests {
             "| Scenario | Cache | Median change | P95 change | Peak working set change | Verdict |"
         ));
         assert!(markdown.contains("Stable"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interrupted_second_artifact_publication_blocks_reads_until_retry_completes() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = unique_report_test_directory("interrupted-pair-publication");
+        let json = directory.join("report.json");
+        let markdown = directory.join("report.md");
+        let publication_marker = directory.join("report.json.publishing");
+        let digest = "8".repeat(64);
+        let passed = protocol_test_report(&digest, 100, 100, 1_000);
+        write_benchmark_report(&json, &passed).unwrap();
+
+        let markdown_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&markdown)
+            .unwrap();
+        let mut failed = passed.clone();
+        failed.run_status = RunStatus::Failed;
+        failed.errors.push("cleanup failed".into());
+
+        let write_error = write_benchmark_report(&json, &failed)
+            .expect_err("the locked second artifact must interrupt publication");
+        assert!(format!("{write_error:#}").contains("publish temporary report"));
+        assert!(publication_marker.is_file());
+        let read_error =
+            read_benchmark_report(&json).expect_err("an incomplete report pair must fail closed");
+        assert!(read_error.to_string().contains("publication is incomplete"));
+        assert!(!directory.join("report.json.tmp").exists());
+        assert!(!directory.join("report.md.tmp").exists());
+
+        drop(markdown_lock);
+        write_benchmark_report(&json, &failed).expect("a complete retry must succeed");
+        assert!(!publication_marker.exists());
+        assert_eq!(read_benchmark_report(&json).unwrap(), failed);
+        assert!(!directory.join("report.json.tmp").exists());
+        assert!(!directory.join("report.md.tmp").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marker_removal_failure_keeps_the_published_pair_unreadable_until_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = unique_report_test_directory("locked-publication-marker");
+        let json = directory.join("report.json");
+        let publication_marker = directory.join("report.json.publishing");
+        let digest = "7".repeat(64);
+        let passed = protocol_test_report(&digest, 100, 100, 1_000);
+        write_benchmark_report(&json, &passed).unwrap();
+        fs::write(&publication_marker, b"publication incomplete\n").unwrap();
+        let marker_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&publication_marker)
+            .unwrap();
+
+        let mut failed = passed;
+        failed.run_status = RunStatus::Failed;
+        failed.errors.push("cleanup failed".into());
+        let write_error = write_benchmark_report(&json, &failed)
+            .expect_err("failure to remove the publication marker must fail the write");
+        assert!(format!("{write_error:#}").contains("publication marker"));
+        assert!(publication_marker.is_file());
+        assert!(read_benchmark_report(&json).is_err());
+
+        drop(marker_lock);
+        write_benchmark_report(&json, &failed).expect("retry must clear the stale marker");
+        assert!(!publication_marker.exists());
+        assert_eq!(read_benchmark_report(&json).unwrap(), failed);
 
         fs::remove_dir_all(directory).unwrap();
     }

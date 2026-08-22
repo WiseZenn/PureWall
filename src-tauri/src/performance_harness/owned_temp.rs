@@ -37,7 +37,7 @@ pub(crate) struct OwnedRunRoot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CleanupFailureState {
-    BeforeRemoval,
+    RemovalNotAttempted,
     RemovalMayBePartial,
 }
 
@@ -190,7 +190,7 @@ impl OwnedRunRoot {
                 return Err(CleanupFailure {
                     owned: self,
                     error,
-                    state: CleanupFailureState::BeforeRemoval,
+                    state: CleanupFailureState::RemovalNotAttempted,
                 });
             }
         };
@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_validation_failure_returns_the_untouched_owned_root() {
+    fn cleanup_validation_failure_returns_ownership_without_attempting_removal() {
         let owned = OwnedRunRoot::create_for_test("cleanup-validation-failure").unwrap();
         let root = owned.root().to_path_buf();
 
@@ -692,7 +692,7 @@ mod tests {
             .expect_err("validation failure must return ownership");
         let (owned, error, state) = failure.into_parts();
 
-        assert_eq!(state, CleanupFailureState::BeforeRemoval);
+        assert_eq!(state, CleanupFailureState::RemovalNotAttempted);
         assert!(format!("{error:#}").contains("injected cleanup validation failure"));
         assert_eq!(owned.root(), root);
         assert!(root.exists());

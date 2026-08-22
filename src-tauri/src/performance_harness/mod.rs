@@ -506,9 +506,10 @@ where
     let write_result = report::write_benchmark_report(report_path, &failed_report);
     let retained = finish(run);
     let retained_message = match state {
-        CleanupFailureState::BeforeRemoval => {
-            format!("performance data retained intact at {}", retained.display())
-        }
+        CleanupFailureState::RemovalNotAttempted => format!(
+            "automatic removal was not attempted; inspect path {}",
+            retained.display()
+        ),
         CleanupFailureState::RemovalMayBePartial => format!(
             "remaining performance data may be partial at {}",
             retained.display()
@@ -1073,13 +1074,141 @@ mod tests {
     }
 
     #[test]
+    fn compare_rejects_an_incomplete_report_publication() {
+        let directory = unique_runner_test_directory("compare-incomplete-publication");
+        let baseline_path = directory.join("baseline.json");
+        let candidate_path = directory.join("candidate.json");
+        let output_path = directory.join("comparison.json");
+        let digest = "6".repeat(64);
+        let baseline = protocol_test_report(&digest, 100, 100, 1_000);
+        let candidate = protocol_test_report(&digest, 100, 100, 1_000);
+        report::write_benchmark_report(&baseline_path, &baseline).unwrap();
+        report::write_benchmark_report(&candidate_path, &candidate).unwrap();
+        std::fs::write(
+            directory.join("baseline.json.publishing"),
+            b"publication incomplete\n",
+        )
+        .unwrap();
+
+        let error = execute_compare(&baseline_path, &candidate_path, &output_path)
+            .expect_err("compare must reject an incomplete input pair");
+        assert!(format!("{error:#}").contains("publication is incomplete"));
+        assert!(!output_path.exists());
+        assert!(!output_path.with_extension("md").exists());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_root_cleanup_failure_does_not_claim_data_is_intact() {
+        let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("cleanup-missing-root-{}-{sequence}", std::process::id());
+        let run = OwnedRunRoot::create_for_test(&run_id).unwrap();
+        let root_path = run.root().to_path_buf();
+        std::fs::remove_dir_all(&root_path).unwrap();
+        let report_directory = unique_runner_test_directory("cleanup-missing-root-report");
+        let report_path = report_directory.join("result.json");
+        report::preflight_benchmark_report_target(&report_path).unwrap();
+        let digest = "5".repeat(64);
+        let scenarios = protocol_test_report(&digest, 100, 100, 1_000).scenarios;
+        let dataset = DatasetFingerprint {
+            schema_version: DATASET_SCHEMA_VERSION,
+            seed: DATASET_SEED,
+            item_count: 120,
+            source_count: 2,
+            manifest_digest: Some(digest),
+        };
+
+        let error = finish_run_with_cleanup(
+            &report_path,
+            CompletedRun {
+                metadata: test_run_metadata(),
+                dataset,
+                scenarios,
+            },
+            run,
+            false,
+            OwnedRunRoot::cleanup,
+            OwnedRunRoot::retain,
+        )
+        .expect_err("a missing root must fail cleanup");
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("automatic removal was not attempted; inspect path"));
+        assert!(!error_chain.contains("retained intact"));
+        assert!(error_chain.contains(&root_path.display().to_string()));
+        let failed = report::read_benchmark_report(&report_path).unwrap();
+        assert_eq!(failed.run_status, RunStatus::Failed);
+        assert!(failed.errors[0].contains("cleanup owned run root"));
+        let markdown = std::fs::read_to_string(report_path.with_extension("md")).unwrap();
+        assert!(markdown.contains("- Run status: Failed"));
+
+        std::fs::remove_dir_all(report_directory).unwrap();
+    }
+
+    #[test]
+    fn tampered_marker_cleanup_failure_does_not_claim_data_is_intact() {
+        let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("cleanup-marker-tamper-{}-{sequence}", std::process::id());
+        let run = OwnedRunRoot::create_for_test(&run_id).unwrap();
+        let root_path = run.root().to_path_buf();
+        let marker_path = root_path.join(".purewall-performance-run.json");
+        let valid_marker = std::fs::read(&marker_path).unwrap();
+        std::fs::write(&marker_path, b"tampered").unwrap();
+        let report_directory = unique_runner_test_directory("cleanup-marker-tamper-report");
+        let report_path = report_directory.join("result.json");
+        report::preflight_benchmark_report_target(&report_path).unwrap();
+        let digest = "4".repeat(64);
+        let scenarios = protocol_test_report(&digest, 100, 100, 1_000).scenarios;
+        let dataset = DatasetFingerprint {
+            schema_version: DATASET_SCHEMA_VERSION,
+            seed: DATASET_SEED,
+            item_count: 120,
+            source_count: 2,
+            manifest_digest: Some(digest),
+        };
+
+        let error = finish_run_with_cleanup(
+            &report_path,
+            CompletedRun {
+                metadata: test_run_metadata(),
+                dataset,
+                scenarios,
+            },
+            run,
+            false,
+            OwnedRunRoot::cleanup,
+            |run| {
+                let path = run.root().to_path_buf();
+                std::fs::write(path.join(".purewall-performance-run.json"), &valid_marker).unwrap();
+                run.cleanup().unwrap();
+                path
+            },
+        )
+        .expect_err("a tampered marker must fail cleanup");
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("automatic removal was not attempted; inspect path"));
+        assert!(!error_chain.contains("retained intact"));
+        assert!(error_chain.contains(&root_path.display().to_string()));
+        let failed = report::read_benchmark_report(&report_path).unwrap();
+        assert_eq!(failed.run_status, RunStatus::Failed);
+        assert!(failed.errors[0].contains("cleanup owned run root"));
+        let markdown = std::fs::read_to_string(report_path.with_extension("md")).unwrap();
+        assert!(markdown.contains("- Run status: Failed"));
+        assert!(!root_path.exists());
+
+        std::fs::remove_dir_all(report_directory).unwrap();
+    }
+
+    #[test]
     fn cleanup_failures_replace_passed_output_with_failed_reports_and_retain_the_path() {
         for (label, state, injected_error, retained_message) in [
             (
                 "cleanup-validation-report",
-                owned_temp::CleanupFailureState::BeforeRemoval,
+                owned_temp::CleanupFailureState::RemovalNotAttempted,
                 "injected cleanup safety validation failure",
-                "performance data retained intact at",
+                "automatic removal was not attempted; inspect path",
             ),
             (
                 "cleanup-removal-report",
@@ -1117,7 +1246,7 @@ mod tests {
                 |run| {
                     run.cleanup_with_test_operations(
                         |owned| {
-                            if state == owned_temp::CleanupFailureState::BeforeRemoval {
+                            if state == owned_temp::CleanupFailureState::RemovalNotAttempted {
                                 bail!(injected_error)
                             }
                             Ok(owned.root().to_path_buf())
