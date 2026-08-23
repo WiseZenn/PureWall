@@ -60,6 +60,13 @@ Phase 7A is building an isolated, repeatable performance evidence loop before ch
 
 See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the contributor workflow and safety boundary.
 
+## Phase 7B: Windows native watcher lifecycle — implemented; awaiting external evidence
+
+- Real Windows notify coverage is isolated behind the `watcher-lifecycle` Cargo feature and ignored tests. Default builds and CI never start an OS watcher.
+- The manual `watcher-lifecycle` workflow requires a GitHub-hosted Windows runner, a unique marker-owned root directly under `RUNNER_TEMP`, read-only repository permission, serial execution, and a fixed timeout.
+- The native scenarios cover nested create/modify/rename/remove delivery through the production root/source queue, watcher-drop quiescence, and an actual Windows junction that production scanning must not traverse.
+- Local verification compiles the feature and runs only pure guard tests. Phase 7B cannot claim real lifecycle success until the manual workflow completes on a matching commit.
+
 ## Explicitly deferred
 
 - **PureWall-X** is a later product built after the ordinary PureWall foundation and release loop are complete. Online feeds, recommendation services, or PureWall-X-only behavior do not belong in current PureWall feature requests.

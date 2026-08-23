@@ -172,6 +172,23 @@ preview needs, reserves capacity for active previews, and drops stale queued thu
 when the cold backlog reaches its limit. Cache keys include source identity and derivative
 profile so changed source files and output settings can refresh safely.
 
+## Native watcher lifecycle evidence
+
+Production watcher ownership remains defined by the bounded root/source queue and the
+watcher-before-queue shutdown order. Real Windows backend coverage is kept outside default
+tests behind the `watcher-lifecycle` Cargo feature and ignored test selection. The manual
+GitHub-hosted Windows workflow creates one marker-owned directory directly under
+`RUNNER_TEMP`, runs the native tests serially with a fixed timeout, and retains the runner
+for automatic disposal instead of performing broad recursive cleanup.
+
+The native scenarios use `scanner::start_watcher` and the production `WatcherQueue` to
+observe nested create/modify/rename/remove final-state semantics without assuming a fixed
+number or order of notify events. They also prove that dropping the watcher prevents a new
+unique path from reaching the queue and that a real owned Windows junction is excluded from
+recursive scanning. The workflow does not initialize Tauri, PureWall AppData, a real library,
+wallpaper application, registry, Recycle Bin, or system settings. Merely defining or locally
+compiling this workflow is not evidence that the external native lifecycle run passed.
+
 ## Windows and safety boundaries
 
 - PureWall operates on local, user-selected source paths; UNC, extended UNC, and mapped

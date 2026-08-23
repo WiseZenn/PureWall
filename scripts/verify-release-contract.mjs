@@ -287,6 +287,46 @@ function validateInstallerSmokeWorkflow(opts = {}) {
   });
 }
 
+const watcherLifecycleWorkflowPath = ".github/workflows/watcher-lifecycle.yml";
+
+const requiredWatcherLifecycleMarkers = [
+  ["manual dispatch", "workflow_dispatch"],
+  ["read-only contents permission", "contents: read"],
+  ["GitHub-hosted Windows runner", "runs-on: windows-latest"],
+  ["bounded job timeout", "timeout-minutes: 20"],
+  ["GitHub-hosted runner guard", "RUNNER_ENVIRONMENT"],
+  ["owned runner temp", "$env:RUNNER_TEMP"],
+  ["owned marker", ".purewall-watcher-lifecycle-owner"],
+  ["watcher lifecycle feature", "--features watcher-lifecycle"],
+  ["ignored tests only", "-- --ignored"],
+  ["serial native tests", "--test-threads=1"],
+  ["pinned checkout action", /actions\/checkout@[0-9a-f]{40}/],
+  ["pinned Rust toolchain action", /dtolnay\/rust-toolchain@[0-9a-f]{40}/],
+];
+
+const forbiddenWatcherLifecycleMarkers = [
+  ["push trigger", "push:"],
+  ["pull request trigger", "pull_request:"],
+  ["scheduled trigger", "schedule:"],
+  ["repository secret", "secrets."],
+  ["recursive removal", "Remove-Item"],
+  ["HKLM registry scope", "HKLM"],
+  ["Windows policy registry scope", "Policies"],
+  ["Windows 11 context-menu CLSID", "86ca1aa0-34aa-4e8b-a509-50c905bae2a2"],
+];
+
+function validateWatcherLifecycleWorkflow(opts = {}) {
+  return validateWorkflowMarkers(
+    watcherLifecycleWorkflowPath,
+    requiredWatcherLifecycleMarkers,
+    forbiddenWatcherLifecycleMarkers,
+    {
+      ...opts,
+      kind: "watcher lifecycle workflow",
+    },
+  );
+}
+
 function runContractSelfTest() {
   const selfTestFailures = [
     ...validSemVers.filter((version) => !semver.test(version)).map((version) => `rejected valid SemVer: ${version}`),
@@ -522,10 +562,68 @@ jobs:
     selfTestFailures.push("installer smoke validator rejected a complete smoke workflow");
   }
 
+  const watcherWorkflowFixture = `name: watcher-lifecycle
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - shell: pwsh
+        run: echo "$env:RUNNER_TEMP RUNNER_ENVIRONMENT .purewall-watcher-lifecycle-owner"
+      - run: cargo test --features watcher-lifecycle watcher_lifecycle_tests:: -- --ignored --test-threads=1
+`;
+  const missingWatcherFailures = validateWatcherLifecycleWorkflow({
+    statPath: () => {
+      throw new Error("C:\\repo\\.github\\workflows\\watcher-lifecycle.yml");
+    },
+  });
+  if (!missingWatcherFailures.some((failure) => failure.includes("missing watcher lifecycle workflow file"))) {
+    selfTestFailures.push("watcher lifecycle validator accepted a missing workflow");
+  }
+  const incompleteWatcherFailures = validateWatcherLifecycleWorkflow({
+    statPath: releaseWorkflowStat,
+    readText: () => `name: watcher-lifecycle\non: {}\n`,
+  });
+  if (!incompleteWatcherFailures.some((failure) => failure.includes("missing manual dispatch marker"))) {
+    selfTestFailures.push("watcher lifecycle validator accepted a workflow without manual dispatch");
+  }
+  const forbiddenWatcherFailures = validateWatcherLifecycleWorkflow({
+    statPath: releaseWorkflowStat,
+    readText: () => `${watcherWorkflowFixture}
+push:
+pull_request:
+schedule:
+secrets.EXAMPLE
+Remove-Item
+HKLM
+Policies
+86ca1aa0-34aa-4e8b-a509-50c905bae2a2
+`,
+  });
+  for (const [label] of forbiddenWatcherLifecycleMarkers) {
+    if (!forbiddenWatcherFailures.some((failure) => failure.includes(`forbidden ${label}`))) {
+      selfTestFailures.push(`watcher lifecycle validator accepted ${label} text`);
+    }
+  }
+  const completeWatcherFailures = validateWatcherLifecycleWorkflow({
+    statPath: releaseWorkflowStat,
+    readText: () => watcherWorkflowFixture,
+  });
+  if (completeWatcherFailures.length > 0) {
+    selfTestFailures.push("watcher lifecycle validator rejected a complete manual workflow");
+  }
+
   selfTestFailures.push(...validatePublicRepositoryFiles());
   selfTestFailures.push(...validateGitIgnoreScope());
   selfTestFailures.push(...validateReleaseWorkflow());
   selfTestFailures.push(...validateInstallerSmokeWorkflow());
+  selfTestFailures.push(...validateWatcherLifecycleWorkflow());
 
   if (selfTestFailures.length) {
     console.error(selfTestFailures.join("\n"));
@@ -557,6 +655,7 @@ failures.push(...validatePublicRepositoryFiles());
 failures.push(...validateGitIgnoreScope());
 failures.push(...validateReleaseWorkflow());
 failures.push(...validateInstallerSmokeWorkflow());
+failures.push(...validateWatcherLifecycleWorkflow());
 
 if (versions.some((version) => version !== versions[0])) failures.push(`version mismatch: ${versions.join(", ")}`);
 if (!semver.test(versions[0] ?? "")) failures.push(`invalid SemVer: ${versions[0]}`);
