@@ -148,6 +148,12 @@ struct ScanBudget {
     entries_seen: usize,
 }
 
+struct DirectoryEntryInspection {
+    file_type: std::fs::FileType,
+    metadata: Option<std::fs::Metadata>,
+    excluded: bool,
+}
+
 fn collect_images(
     dir: &Path,
     images: &mut Vec<ImageInfo>,
@@ -164,10 +170,8 @@ fn collect_images(
     if dir.is_dir() {
         for entry in std::fs::read_dir(dir).context("Failed to read directory")? {
             let entry = entry.context("Failed to read directory entry")?;
-            let file_type = entry
-                .file_type()
-                .context("Failed to inspect directory entry type")?;
-            if file_type.is_symlink() || entry_is_reparse_point(&entry)? {
+            let inspection = inspect_directory_entry(&entry)?;
+            if inspection.excluded {
                 continue;
             }
 
@@ -181,16 +185,16 @@ fn collect_images(
 
             let path = entry.path();
 
-            if file_type.is_dir() {
+            if inspection.file_type.is_dir() {
                 collect_images(&path, images, depth + 1, budget)?;
-            } else if file_type.is_file() && is_supported_image(&path) {
+            } else if inspection.file_type.is_file() && is_supported_image(&path) {
                 if images.len() >= MAX_SCAN_IMAGES {
                     anyhow::bail!(
                         "Too many images found. PureWall scans up to {} images at once.",
                         MAX_SCAN_IMAGES
                     );
                 }
-                if let Some(info) = get_scanned_image_info(&path) {
+                if let Some(info) = get_scanned_image_info(&path, inspection.metadata.as_ref()) {
                     images.push(info);
                 }
             }
@@ -200,19 +204,32 @@ fn collect_images(
 }
 
 #[cfg(windows)]
-fn entry_is_reparse_point(entry: &std::fs::DirEntry) -> Result<bool> {
+fn inspect_directory_entry(entry: &std::fs::DirEntry) -> Result<DirectoryEntryInspection> {
     use std::os::windows::fs::MetadataExt;
 
     let metadata = std::fs::symlink_metadata(entry.path())
         .context("Failed to inspect directory entry attributes")?;
-    Ok(windows_attributes_are_reparse_point(
-        metadata.file_attributes(),
-    ))
+    let file_type = metadata.file_type();
+    let excluded =
+        file_type.is_symlink() || windows_attributes_are_reparse_point(metadata.file_attributes());
+    Ok(DirectoryEntryInspection {
+        file_type,
+        metadata: Some(metadata),
+        excluded,
+    })
 }
 
 #[cfg(not(windows))]
-fn entry_is_reparse_point(_entry: &std::fs::DirEntry) -> Result<bool> {
-    Ok(false)
+fn inspect_directory_entry(entry: &std::fs::DirEntry) -> Result<DirectoryEntryInspection> {
+    let file_type = entry
+        .file_type()
+        .context("Failed to inspect directory entry type")?;
+    let excluded = file_type.is_symlink();
+    Ok(DirectoryEntryInspection {
+        file_type,
+        metadata: None,
+        excluded,
+    })
 }
 
 #[cfg(windows)]
@@ -294,12 +311,27 @@ fn get_image_info(path: &Path) -> Option<ImageInfo> {
     get_image_info_with_stored_path(path, stored_path)
 }
 
-fn get_scanned_image_info(path: &Path) -> Option<ImageInfo> {
-    get_image_info_with_stored_path(path, path.to_string_lossy().into_owned())
+fn get_scanned_image_info(
+    path: &Path,
+    verified_metadata: Option<&std::fs::Metadata>,
+) -> Option<ImageInfo> {
+    let stored_path = path.to_string_lossy().into_owned();
+    match verified_metadata {
+        Some(metadata) => build_image_info(path, stored_path, metadata),
+        None => get_image_info_with_stored_path(path, stored_path),
+    }
 }
 
 fn get_image_info_with_stored_path(path: &Path, stored_path: String) -> Option<ImageInfo> {
     let metadata = std::fs::metadata(path).ok()?;
+    build_image_info(path, stored_path, &metadata)
+}
+
+fn build_image_info(
+    path: &Path,
+    stored_path: String,
+    metadata: &std::fs::Metadata,
+) -> Option<ImageInfo> {
     let file_size = metadata.len();
 
     // Calculate hash based on canonical path + size + modified time
@@ -483,6 +515,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(2, 3), (4, 5)]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scanned_image_info_reuses_verified_entry_metadata() {
+        let root = unique_test_directory("scan-entry-metadata");
+        let image_path = root.0.join("metadata.png");
+        image::RgbImage::new(3, 7)
+            .save(&image_path)
+            .expect("test image should be written");
+        let canonical_path = std::fs::canonicalize(&image_path).unwrap();
+        let stored_path = canonical_path.to_string_lossy().into_owned();
+        let metadata = std::fs::symlink_metadata(&image_path).unwrap();
+        let expected_size = metadata.len();
+        std::fs::remove_file(&image_path).unwrap();
+
+        let info = get_scanned_image_info(&canonical_path, Some(&metadata))
+            .expect("verified entry metadata should avoid a second metadata lookup");
+
+        assert_eq!(info.path, stored_path);
+        assert_eq!(info.file_size, expected_size);
+        assert_eq!((info.width, info.height), (0, 0));
     }
 
     #[test]
