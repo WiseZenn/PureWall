@@ -31,8 +31,8 @@ use self::{
         ScenarioSamples, REPORT_SCHEMA_VERSION, SCENARIO_CONTRACT_VERSION,
     },
     scenarios::{
-        run_library_scenarios, run_playback_and_media_scenarios, SamplePolicy, ScenarioFailureKind,
-        ScenarioRunFailure,
+        is_known_scenario_id, run_library_scenarios, run_playback_and_media_scenarios,
+        SamplePolicy, ScenarioFailureKind, ScenarioRunFailure,
     },
 };
 
@@ -45,6 +45,7 @@ enum HarnessCommand {
         report: PathBuf,
         keep_data: bool,
         allow_stress: bool,
+        hotspot: Option<String>,
     },
     Compare {
         baseline: PathBuf,
@@ -75,6 +76,7 @@ fn parse_run_command(args: &[String]) -> Result<HarnessCommand> {
     let mut report = None;
     let mut keep_data = false;
     let mut allow_stress = false;
+    let mut hotspot = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -113,6 +115,17 @@ fn parse_run_command(args: &[String]) -> Result<HarnessCommand> {
                 }
                 allow_stress = true;
             }
+            "--hotspot" => {
+                if hotspot.is_some() {
+                    bail!("duplicate --hotspot option");
+                }
+                index += 1;
+                let value = args.get(index).context("--hotspot requires a value")?;
+                if !is_known_scenario_id(value) {
+                    bail!("unknown performance hotspot: {value}");
+                }
+                hotspot = Some(value.clone());
+            }
             option => bail!("unknown run option: {option}"),
         }
         index += 1;
@@ -129,6 +142,7 @@ fn parse_run_command(args: &[String]) -> Result<HarnessCommand> {
         report: report.context("run requires --report")?,
         keep_data,
         allow_stress,
+        hotspot,
     })
 }
 
@@ -309,7 +323,8 @@ fn execute_command(command: HarnessCommand) -> Result<()> {
             report,
             keep_data,
             allow_stress,
-        } => execute_run(scale, &report, keep_data, allow_stress),
+            hotspot,
+        } => execute_run(scale, &report, keep_data, allow_stress, hotspot.as_deref()),
         HarnessCommand::Compare {
             baseline,
             candidate,
@@ -323,6 +338,7 @@ fn execute_run(
     report_path: &Path,
     keep_data: bool,
     allow_stress: bool,
+    hotspot: Option<&str>,
 ) -> Result<()> {
     let sequence = RUN_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let run_id = format!(
@@ -330,7 +346,14 @@ fn execute_run(
         std::process::id(),
         chrono::Utc::now().timestamp_millis()
     );
-    execute_run_with_id(scale, report_path, keep_data, allow_stress, &run_id)
+    execute_run_with_id(
+        scale,
+        report_path,
+        keep_data,
+        allow_stress,
+        hotspot,
+        &run_id,
+    )
 }
 
 fn execute_run_with_id(
@@ -338,6 +361,7 @@ fn execute_run_with_id(
     report_path: &Path,
     keep_data: bool,
     allow_stress: bool,
+    hotspot: Option<&str>,
     run_id: &str,
 ) -> Result<()> {
     let policy = sample_policy(scale);
@@ -409,6 +433,16 @@ fn execute_run_with_id(
 
     let mut scenarios = library_records;
     scenarios.extend(media_records);
+    if let Err(error) = apply_selected_hotspot(&mut scenarios, hotspot) {
+        let report = failed_orchestration_report(
+            metadata,
+            dataset_fingerprint,
+            scenarios,
+            "select candidate hotspot",
+            &error,
+        );
+        return persist_failed_report_and_retain(report_path, report, run, error);
+    }
     finish_run_with_cleanup(
         report_path,
         CompletedRun {
@@ -421,6 +455,33 @@ fn execute_run_with_id(
         OwnedRunRoot::cleanup,
         OwnedRunRoot::retain,
     )
+}
+
+fn apply_selected_hotspot(scenarios: &mut [ScenarioRecord], hotspot: Option<&str>) -> Result<()> {
+    if scenarios.iter().any(|scenario| scenario.selected_hotspot) {
+        bail!("run scenarios must not preselect a hotspot");
+    }
+    let Some(hotspot) = hotspot else {
+        return Ok(());
+    };
+    let matching = scenarios
+        .iter()
+        .enumerate()
+        .filter(|(_, scenario)| scenario.id == hotspot)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        bail!(
+            "selected hotspot {hotspot} must match exactly one completed scenario; matched {}",
+            matching.len()
+        );
+    }
+    let index = matching[0];
+    if !scenarios[index].critical {
+        bail!("selected hotspot {hotspot} must be a critical scenario");
+    }
+    scenarios[index].selected_hotspot = true;
+    Ok(())
 }
 
 fn finish_run_with_cleanup<Cleanup, Finish>(
@@ -794,6 +855,68 @@ mod tests {
         assert!(parse_command(&relative).is_err());
         assert!(parse_command(&unsafe_stress).is_err());
         assert!(parse_command(&explicit_stress).is_ok());
+    }
+
+    #[test]
+    fn parser_accepts_one_known_candidate_hotspot_and_rejects_invalid_selection() {
+        let candidate = [
+            "run",
+            "--scale",
+            "standard",
+            "--report",
+            "D:\\reports\\candidate.json",
+            "--hotspot",
+            "scan.full",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            parse_command(&candidate).unwrap(),
+            HarnessCommand::Run {
+                scale: DatasetScale::Standard,
+                report: PathBuf::from("D:\\reports\\candidate.json"),
+                keep_data: false,
+                allow_stress: false,
+                hotspot: Some("scan.full".into()),
+            }
+        );
+
+        for invalid in [
+            vec!["--hotspot", "unknown.scenario"],
+            vec!["--hotspot", "scan.full", "--hotspot", "scan.full"],
+        ] {
+            let mut arguments = vec![
+                "run",
+                "--scale",
+                "standard",
+                "--report",
+                "D:\\reports\\candidate.json",
+            ];
+            arguments.extend(invalid);
+            assert!(parse_command(
+                &arguments
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn candidate_hotspot_selection_marks_exactly_one_scenario() {
+        let mut scenarios = protocol_test_report(&"a".repeat(64), 100, 100, 1_000).scenarios;
+        scenarios[0].id = "scan.full".into();
+
+        apply_selected_hotspot(&mut scenarios, Some("scan.full")).unwrap();
+
+        assert_eq!(
+            scenarios
+                .iter()
+                .filter(|scenario| scenario.selected_hotspot)
+                .map(|scenario| scenario.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scan.full"]
+        );
     }
 
     #[test]
@@ -1289,7 +1412,7 @@ mod tests {
         std::fs::create_dir_all(&report_directory).unwrap();
         let report_path = report_directory.join("ci.json");
 
-        execute_run_with_id(DatasetScale::Ci, &report_path, false, false, &run_id).unwrap();
+        execute_run_with_id(DatasetScale::Ci, &report_path, false, false, None, &run_id).unwrap();
 
         let report = report::read_benchmark_report(&report_path).unwrap();
         assert_eq!(report.run_status, RunStatus::Passed);
@@ -1298,6 +1421,45 @@ mod tests {
             scenario.status == RunStatus::Passed && scenario.errors.is_empty()
         }));
         assert!(report_path.with_extension("md").is_file());
+        assert!(!std::env::temp_dir()
+            .join("purewall-performance")
+            .join(&run_id)
+            .exists());
+
+        std::fs::remove_dir_all(report_directory).unwrap();
+    }
+
+    #[test]
+    fn ci_candidate_run_writes_exactly_one_selected_hotspot() {
+        let sequence = RUNNER_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("task7-ci-candidate-{}-{sequence}", std::process::id());
+        let report_directory = std::env::temp_dir()
+            .join("purewall-performance-runner-tests")
+            .join(&run_id);
+        std::fs::create_dir_all(&report_directory).unwrap();
+        let report_path = report_directory.join("ci-candidate.json");
+
+        execute_run_with_id(
+            DatasetScale::Ci,
+            &report_path,
+            false,
+            false,
+            Some("scan.full"),
+            &run_id,
+        )
+        .unwrap();
+
+        let report = report::read_benchmark_report(&report_path).unwrap();
+        assert_eq!(report.run_status, RunStatus::Passed);
+        assert_eq!(
+            report
+                .scenarios
+                .iter()
+                .filter(|scenario| scenario.selected_hotspot)
+                .map(|scenario| scenario.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scan.full"]
+        );
         assert!(!std::env::temp_dir()
             .join("purewall-performance")
             .join(&run_id)

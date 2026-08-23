@@ -44,6 +44,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-harn
 
 Standard is the normal local baseline scale. Run baseline and candidate measurements on the same machine, with the same build profile and effective harness configuration.
 
+After an untouched baseline has identified and documented one scenario, mark only the candidate run with `-Hotspot`. The harness validates the scenario ID against its compiled contract and writes `selected_hotspot` into exactly one completed critical scenario; do not edit either JSON report by hand.
+
+```powershell
+$candidate = Join-Path (Resolve-Path .).Path 'output/performance/standard-candidate.json'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-harness.ps1 `
+  -Mode Run -Scale Standard -Hotspot scan.full -Report $candidate
+```
+
 ### Stress: 100,000 items across ten roots
 
 ```powershell
@@ -54,7 +62,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-performance-harn
 
 Stress requires the additional `-AllowStress` opt-in. It is not a CI gate and should be run only when its disk, time, and memory cost is intentional. The presence of this command does not mean a Stress run has been completed.
 
-Add `-KeepData` to a Run command only when the synthetic root is needed for investigation. Compare mode does not accept `-KeepData` or `-AllowStress`.
+Add `-KeepData` to a Run command only when the synthetic root is needed for investigation. Compare mode does not accept `-KeepData`, `-AllowStress`, or `-Hotspot`.
 
 ## Compare commands
 

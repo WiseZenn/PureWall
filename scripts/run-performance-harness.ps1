@@ -4,6 +4,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Report,
   [string]$Baseline = '',
   [string]$Candidate = '',
+  [string]$Hotspot = '',
   [switch]$KeepData,
   [switch]$AllowStress
 )
@@ -80,12 +81,18 @@ if ($Mode -eq 'Run') {
   if ($AllowStress) {
     $cargoArguments += '--allow-stress'
   }
+  if (-not [string]::IsNullOrWhiteSpace($Hotspot)) {
+    $cargoArguments += @('--hotspot', $Hotspot)
+  }
 } else {
   if ($KeepData) {
     throw 'KeepData is valid only in Run mode'
   }
   if ($AllowStress) {
     throw 'AllowStress is valid only in Run mode'
+  }
+  if (-not [string]::IsNullOrWhiteSpace($Hotspot)) {
+    throw 'Hotspot is valid only in Run mode'
   }
   $baselinePath = Resolve-JsonInputPath -Value $Baseline -Role 'Baseline'
   $candidatePath = Resolve-JsonInputPath -Value $Candidate -Role 'Candidate'

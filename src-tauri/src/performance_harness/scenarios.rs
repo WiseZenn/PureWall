@@ -47,6 +47,10 @@ const SCENARIO_IDS: [&str; 19] = [
     "media.preview.active-claim",
 ];
 
+pub(crate) fn is_known_scenario_id(id: &str) -> bool {
+    SCENARIO_IDS.contains(&id)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SamplePolicy {
     pub(crate) heavy: usize,
