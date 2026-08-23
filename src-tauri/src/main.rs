@@ -65,6 +65,8 @@ mod widget;
 #[cfg(windows)]
 mod windows_image_decoder;
 
+#[cfg(all(test, windows, feature = "watcher-lifecycle"))]
+mod watcher_lifecycle_tests;
 #[cfg(all(test, windows))]
 mod windows_image_decoder_tests;
 
