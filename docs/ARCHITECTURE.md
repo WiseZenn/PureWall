@@ -167,6 +167,15 @@ and focus monitoring use condition-variable signaling so idle operation does not
 unnecessarily. A committed playback action persists its applicable history/current state
 before best-effort UI notification.
 
+The central stage is a displayed-wallpaper management surface: gallery selection can make
+`activeWallpaper` differ from the persisted desktop `currentWallpaper`. Stage Like/Dislike
+therefore captures the visible active path and uses the existing path-targeted rating commands;
+pressing an already active rating clears it. Next and Pause continue through the shared typed
+playback executor. A local exclusive action gate disables the four stage actions until the
+current promise settles, so rapid clicks do not queue duplicate dock commands or retarget an
+in-flight rating. This UI boundary does not change the 2x liked selection weight, playback
+events, SQLite schema, or tray/CLI/timer/context-menu/widget semantics.
+
 The media queue is bounded and keyed by normalized source path. It merges thumbnail and
 preview needs, reserves capacity for active previews, and drops stale queued thumbnail work
 when the cold backlog reaches its limit. Cache keys include source identity and derivative

@@ -67,6 +67,13 @@ See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for the contributor workflow and 
 - The native scenarios cover nested create/modify/rename/remove delivery through the production root/source queue, watcher-drop quiescence, and an actual Windows junction that production scanning must not traverse.
 - Local verification compiles the feature and runs only pure guard tests. Phase 7B cannot claim real lifecycle success until the manual workflow completes on a matching commit.
 
+## Phase 7C: direct playback and rating controls — locally complete
+
+- The central stage Like/Dislike controls now target the exact wallpaper displayed on the stage rather than a different persisted current row.
+- Pressing an active rating clears it, while pressing the opposite rating switches directly. Labels and `aria-pressed` state follow the displayed wallpaper.
+- One in-flight stage action owns the dock until completion, preventing double-click command bursts and rating-target drift inside that control surface.
+- Next and Pause retain the shared typed playback route; weighted random tickets, tray, CLI, timer, context-menu, and widget behavior remain unchanged. This phase adds no selection explanation, recommendation service, or PureWall-X behavior.
+
 ## Explicitly deferred
 
 - **PureWall-X** is a later product built after the ordinary PureWall foundation and release loop are complete. Online feeds, recommendation services, or PureWall-X-only behavior do not belong in current PureWall feature requests.
