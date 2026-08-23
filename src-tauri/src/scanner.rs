@@ -101,7 +101,14 @@ where
 
     let mut images = Vec::new();
     let mut budget = ScanBudget::default();
-    collect_images(&canonical_root, &mut images, 0, &mut budget)?;
+    let mut dimension_cache = ScanDimensionCache::default();
+    collect_images(
+        &canonical_root,
+        &mut images,
+        0,
+        &mut budget,
+        &mut dimension_cache,
+    )?;
 
     // Sort by file name for consistent ordering
     images.sort_by(|a, b| a.path.cmp(&b.path));
@@ -148,6 +155,21 @@ struct ScanBudget {
     entries_seen: usize,
 }
 
+#[derive(Default)]
+struct ScanDimensionCache {
+    #[cfg(windows)]
+    dimensions: std::collections::HashMap<PhysicalImageIdentity, (u32, u32)>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PhysicalImageIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    file_size: u64,
+    last_write_time: u64,
+}
+
 struct DirectoryEntryInspection {
     file_type: std::fs::FileType,
     metadata: Option<std::fs::Metadata>,
@@ -159,6 +181,7 @@ fn collect_images(
     images: &mut Vec<ImageInfo>,
     depth: usize,
     budget: &mut ScanBudget,
+    dimension_cache: &mut ScanDimensionCache,
 ) -> Result<()> {
     if depth > MAX_SCAN_DEPTH {
         anyhow::bail!(
@@ -186,7 +209,7 @@ fn collect_images(
             let path = entry.path();
 
             if inspection.file_type.is_dir() {
-                collect_images(&path, images, depth + 1, budget)?;
+                collect_images(&path, images, depth + 1, budget, dimension_cache)?;
             } else if inspection.file_type.is_file() && is_supported_image(&path) {
                 if images.len() >= MAX_SCAN_IMAGES {
                     anyhow::bail!(
@@ -194,7 +217,9 @@ fn collect_images(
                         MAX_SCAN_IMAGES
                     );
                 }
-                if let Some(info) = get_scanned_image_info(&path, inspection.metadata.as_ref()) {
+                if let Some(info) =
+                    get_scanned_image_info(&path, inspection.metadata.as_ref(), dimension_cache)
+                {
                     images.push(info);
                 }
             }
@@ -314,23 +339,34 @@ fn get_image_info(path: &Path) -> Option<ImageInfo> {
 fn get_scanned_image_info(
     path: &Path,
     verified_metadata: Option<&std::fs::Metadata>,
+    dimension_cache: &mut ScanDimensionCache,
 ) -> Option<ImageInfo> {
     let stored_path = path.to_string_lossy().into_owned();
+    let dimensions = get_scanned_dimensions(path, dimension_cache).unwrap_or((0, 0));
     match verified_metadata {
-        Some(metadata) => build_image_info(path, stored_path, metadata),
-        None => get_image_info_with_stored_path(path, stored_path),
+        Some(metadata) => build_image_info(stored_path, metadata, dimensions),
+        None => get_image_info_with_stored_path_and_dimensions(path, stored_path, dimensions),
     }
 }
 
 fn get_image_info_with_stored_path(path: &Path, stored_path: String) -> Option<ImageInfo> {
+    let dimensions = get_dimensions(path).unwrap_or((0, 0));
+    get_image_info_with_stored_path_and_dimensions(path, stored_path, dimensions)
+}
+
+fn get_image_info_with_stored_path_and_dimensions(
+    path: &Path,
+    stored_path: String,
+    dimensions: (u32, u32),
+) -> Option<ImageInfo> {
     let metadata = std::fs::metadata(path).ok()?;
-    build_image_info(path, stored_path, &metadata)
+    build_image_info(stored_path, &metadata, dimensions)
 }
 
 fn build_image_info(
-    path: &Path,
     stored_path: String,
     metadata: &std::fs::Metadata,
+    dimensions: (u32, u32),
 ) -> Option<ImageInfo> {
     let file_size = metadata.len();
 
@@ -346,8 +382,7 @@ fn build_image_info(
         stable_fingerprint(&format!("{}:{}:{}", stored_path, file_size, modified))
     );
 
-    // Try to get image dimensions
-    let (width, height) = get_dimensions(path).unwrap_or((0, 0));
+    let (width, height) = dimensions;
 
     Some(ImageInfo {
         path: stored_path,
@@ -356,6 +391,64 @@ fn build_image_info(
         height,
         file_size,
     })
+}
+
+#[cfg(windows)]
+fn get_scanned_dimensions(path: &Path, cache: &mut ScanDimensionCache) -> Option<(u32, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let format = image::ImageFormat::from_extension(path.extension()?)?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .ok()?;
+    let file = unsafe { std::fs::File::from_raw_handle(handle.0) };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return None;
+    }
+    let identity = PhysicalImageIdentity {
+        volume_serial: info.dwVolumeSerialNumber,
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        file_size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+        last_write_time: (u64::from(info.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(info.ftLastWriteTime.dwLowDateTime),
+    };
+    if let Some(dimensions) = cache.dimensions.get(&identity) {
+        return Some(*dimensions);
+    }
+    let dimensions = image::ImageReader::with_format(std::io::BufReader::new(file), format)
+        .into_dimensions()
+        .ok()?;
+    cache.dimensions.insert(identity, dimensions);
+    Some(dimensions)
+}
+
+#[cfg(not(windows))]
+fn get_scanned_dimensions(path: &Path, _cache: &mut ScanDimensionCache) -> Option<(u32, u32)> {
+    get_dimensions(path)
 }
 
 fn get_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -531,12 +624,49 @@ mod tests {
         let expected_size = metadata.len();
         std::fs::remove_file(&image_path).unwrap();
 
-        let info = get_scanned_image_info(&canonical_path, Some(&metadata))
-            .expect("verified entry metadata should avoid a second metadata lookup");
+        let info = get_scanned_image_info(
+            &canonical_path,
+            Some(&metadata),
+            &mut ScanDimensionCache::default(),
+        )
+        .expect("verified entry metadata should avoid a second metadata lookup");
 
         assert_eq!(info.path, stored_path);
         assert_eq!(info.file_size, expected_size);
         assert_eq!((info.width, info.height), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_linked_images_share_one_physical_dimension_cache_entry() {
+        let root = unique_test_directory("scan-dimension-cache");
+        let original = root.0.join("original.png");
+        let hard_link = root.0.join("hard-link.png");
+        let independent = root.0.join("independent.png");
+        image::RgbImage::new(11, 13)
+            .save(&original)
+            .expect("original image should be written");
+        std::fs::hard_link(&original, &hard_link).expect("hard link should be created");
+        image::RgbImage::new(11, 13)
+            .save(&independent)
+            .expect("independent image should be written");
+        let mut cache = ScanDimensionCache::default();
+
+        assert_eq!(
+            get_scanned_dimensions(&original, &mut cache),
+            Some((11, 13))
+        );
+        assert_eq!(
+            get_scanned_dimensions(&hard_link, &mut cache),
+            Some((11, 13))
+        );
+        assert_eq!(cache.dimensions.len(), 1);
+
+        assert_eq!(
+            get_scanned_dimensions(&independent, &mut cache),
+            Some((11, 13))
+        );
+        assert_eq!(cache.dimensions.len(), 2);
     }
 
     #[test]
