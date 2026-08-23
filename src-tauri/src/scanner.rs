@@ -76,15 +76,32 @@ fn validate_scan_root_metadata(path: &Path, metadata: ScanRootMetadata) -> Resul
 
 fn scan_folder_with_root_inspection<F>(folder_path: &str, inspect_root: F) -> Result<Vec<ImageInfo>>
 where
-    F: FnOnce(&Path) -> Result<ScanRootMetadata>,
+    F: FnMut(&Path) -> Result<ScanRootMetadata>,
+{
+    scan_folder_with_root_inspection_and_canonicalization(folder_path, inspect_root, |path| {
+        std::fs::canonicalize(path)
+    })
+}
+
+fn scan_folder_with_root_inspection_and_canonicalization<F, C>(
+    folder_path: &str,
+    mut inspect_root: F,
+    canonicalize_root: C,
+) -> Result<Vec<ImageInfo>>
+where
+    F: FnMut(&Path) -> Result<ScanRootMetadata>,
+    C: FnOnce(&Path) -> std::io::Result<std::path::PathBuf>,
 {
     let root = Path::new(folder_path);
     ensure_local_path(root)?;
     validate_scan_root_metadata(root, inspect_root(root)?)?;
+    let canonical_root = canonicalize_root(root).context("Failed to resolve folder path")?;
+    ensure_local_path(&canonical_root)?;
+    validate_scan_root_metadata(&canonical_root, inspect_root(&canonical_root)?)?;
 
     let mut images = Vec::new();
     let mut budget = ScanBudget::default();
-    collect_images(root, &mut images, 0, &mut budget)?;
+    collect_images(&canonical_root, &mut images, 0, &mut budget)?;
 
     // Sort by file name for consistent ordering
     images.sort_by(|a, b| a.path.cmp(&b.path));
@@ -173,7 +190,7 @@ fn collect_images(
                         MAX_SCAN_IMAGES
                     );
                 }
-                if let Some(info) = get_image_info(&path) {
+                if let Some(info) = get_scanned_image_info(&path) {
                     images.push(info);
                 }
             }
@@ -268,15 +285,22 @@ fn reject_remote_drive(path: &Path) -> Result<()> {
 }
 
 fn get_image_info(path: &Path) -> Option<ImageInfo> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let file_size = metadata.len();
-
     // Canonicalize the path before storing so validation later matches (HIG-06).
     let stored_path = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string();
+    get_image_info_with_stored_path(path, stored_path)
+}
+
+fn get_scanned_image_info(path: &Path) -> Option<ImageInfo> {
+    get_image_info_with_stored_path(path, path.to_string_lossy().into_owned())
+}
+
+fn get_image_info_with_stored_path(path: &Path, stored_path: String) -> Option<ImageInfo> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let file_size = metadata.len();
 
     // Calculate hash based on canonical path + size + modified time
     let modified = metadata
@@ -384,7 +408,82 @@ mod tests {
     use super::*;
     use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
     use notify::{Event, EventKind};
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn unique_test_directory(name: &str) -> TestDirectory {
+        let root = std::env::temp_dir().join(format!(
+            "purewall-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        TestDirectory(root)
+    }
+
+    #[test]
+    fn folder_scan_canonicalizes_the_root_once_and_preserves_canonical_image_paths() {
+        let root = unique_test_directory("scan-root-canonicalization");
+        let nested = root.0.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested test directory should be created");
+        let first = root.0.join("first.png");
+        let second = nested.join("second.png");
+        image::RgbImage::new(2, 3)
+            .save(&first)
+            .expect("first test image should be written");
+        image::RgbImage::new(4, 5)
+            .save(&second)
+            .expect("second test image should be written");
+
+        let canonicalize_calls = Cell::new(0);
+        let images = scan_folder_with_root_inspection_and_canonicalization(
+            &root.0.to_string_lossy(),
+            inspect_scan_root,
+            |path| {
+                canonicalize_calls.set(canonicalize_calls.get() + 1);
+                std::fs::canonicalize(path)
+            },
+        )
+        .expect("folder scan should succeed");
+
+        assert_eq!(canonicalize_calls.get(), 1);
+        let mut expected_paths = vec![
+            std::fs::canonicalize(first)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            std::fs::canonicalize(second)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        expected_paths.sort();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.path.clone())
+                .collect::<Vec<_>>(),
+            expected_paths
+        );
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| (image.width, image.height))
+                .collect::<Vec<_>>(),
+            vec![(2, 3), (4, 5)]
+        );
+    }
 
     #[test]
     fn scan_files_rejects_too_many_paths_before_touching_disk() {
