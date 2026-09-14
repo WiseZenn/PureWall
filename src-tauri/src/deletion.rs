@@ -397,7 +397,6 @@ fn inspect_and_prepare(path: &str) -> Result<PreparedDelete, Rejection> {
 
 #[cfg(windows)]
 fn inspect_path(path: &str) -> Result<IdentitySnapshot, Rejection> {
-    use crate::paths::path_identity_key;
     use std::path::{Component, Prefix};
 
     let input = Path::new(path);
@@ -432,17 +431,43 @@ fn inspect_path(path: &str) -> Result<IdentitySnapshot, Rejection> {
     validate_component_identities(&components, path)?;
 
     let resolved_path = handle_resolved_path(input)?;
-    if path_identity_key(Path::new(&resolved_path)) != path_identity_key(input) {
+    let resolved_components = capture_component_chain(Path::new(&resolved_path))?;
+    let stable_identity = validate_resolved_path_identity(
+        input,
+        Path::new(&resolved_path),
+        &components,
+        &resolved_components,
+    )?;
+
+    Ok(IdentitySnapshot {
+        resolved_path: stable_identity,
+        components,
+    })
+}
+
+#[cfg(windows)]
+fn validate_resolved_path_identity(
+    input: &Path,
+    resolved: &Path,
+    input_components: &[FileIdentity],
+    resolved_components: &[FileIdentity],
+) -> Result<String, Rejection> {
+    use crate::paths::{lexical_path_identity, path_identity_key};
+
+    let input_identity = path_identity_key(input);
+    if lexical_path_identity(input).as_deref() != Some(input_identity.as_str())
+        || input_components != resolved_components
+    {
         return Err(rejection(
             "canonical_path_mismatch",
-            format!("Wallpaper handle resolved to a different path: {path}"),
+            format!(
+                "Wallpaper handle resolved to a different path: {}",
+                resolved.display()
+            ),
         ));
     }
 
-    Ok(IdentitySnapshot {
-        resolved_path: path_identity_key(Path::new(&resolved_path)),
-        components,
-    })
+    Ok(input_identity)
 }
 
 #[cfg(windows)]
@@ -1134,26 +1159,18 @@ mod tests {
 
         #[test]
         fn short_and_long_path_spellings_share_identity_when_component_chains_match() {
-            let registered = Path::new(
-                r"C:\Users\runneradmin\AppData\Local\Temp\purewall-delete\wallpaper.jpg",
-            );
+            let registered =
+                Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\purewall-delete\wallpaper.jpg");
             let resolved = Path::new(
                 r"\\?\C:\Users\RUNNER~1\AppData\Local\Temp\purewall-delete\wallpaper.jpg",
             );
             let components = vec![synthetic_identity(1), synthetic_identity(2)];
 
-            let stable_identity = validate_resolved_path_identity(
-                registered,
-                resolved,
-                &components,
-                &components,
-            )
-            .expect("the same handle identity chain should accept a DOS short-name alias");
+            let stable_identity =
+                validate_resolved_path_identity(registered, resolved, &components, &components)
+                    .expect("the same handle identity chain should accept a DOS short-name alias");
 
-            assert_eq!(
-                stable_identity,
-                crate::paths::path_identity_key(registered)
-            );
+            assert_eq!(stable_identity, crate::paths::path_identity_key(registered));
         }
 
         #[test]
