@@ -1095,6 +1095,14 @@ mod tests {
         use std::fs;
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        fn synthetic_identity(seed: u8) -> FileIdentity {
+            FileIdentity {
+                volume_serial: u64::from(seed),
+                file_id: [seed; 16],
+                attributes: 0,
+            }
+        }
+
         fn fixture_root(label: &str) -> PathBuf {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1122,6 +1130,53 @@ mod tests {
                 "regular file should be inspectable: {result:?}"
             );
             cleanup(&root);
+        }
+
+        #[test]
+        fn short_and_long_path_spellings_share_identity_when_component_chains_match() {
+            let registered = Path::new(
+                r"C:\Users\runneradmin\AppData\Local\Temp\purewall-delete\wallpaper.jpg",
+            );
+            let resolved = Path::new(
+                r"\\?\C:\Users\RUNNER~1\AppData\Local\Temp\purewall-delete\wallpaper.jpg",
+            );
+            let components = vec![synthetic_identity(1), synthetic_identity(2)];
+
+            let stable_identity = validate_resolved_path_identity(
+                registered,
+                resolved,
+                &components,
+                &components,
+            )
+            .expect("the same handle identity chain should accept a DOS short-name alias");
+
+            assert_eq!(
+                stable_identity,
+                crate::paths::path_identity_key(registered)
+            );
+        }
+
+        #[test]
+        fn resolved_path_with_a_different_component_chain_is_rejected() {
+            let registered = Path::new(r"C:\Walls\wallpaper.jpg");
+            let resolved = Path::new(r"\\?\C:\Other\wallpaper.jpg");
+            let registered_components = vec![synthetic_identity(1), synthetic_identity(2)];
+            let resolved_components = vec![synthetic_identity(1), synthetic_identity(3)];
+
+            let result = validate_resolved_path_identity(
+                registered,
+                resolved,
+                &registered_components,
+                &resolved_components,
+            );
+
+            assert!(matches!(
+                result,
+                Err(Rejection {
+                    code: "canonical_path_mismatch",
+                    ..
+                })
+            ));
         }
 
         #[test]
