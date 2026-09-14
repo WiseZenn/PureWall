@@ -465,6 +465,90 @@ fn same_path(left: &Path, right: &Path) -> bool {
     path_identity(left) == path_identity(right)
 }
 
+fn validate_resolved_cleanup_identity_with<F>(
+    registered: &Path,
+    resolved: &Path,
+    same_file: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> Result<bool>,
+{
+    if same_path(registered, resolved) || same_file(registered, resolved)? {
+        return Ok(());
+    }
+    bail!("performance cleanup target uses an unresolved path alias");
+}
+
+#[cfg(windows)]
+fn same_windows_file_identity(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    #[derive(PartialEq, Eq)]
+    struct WindowsFileIdentity {
+        volume_serial: u64,
+        file_id: [u8; 16],
+    }
+
+    struct WindowsHandle(HANDLE);
+
+    impl Drop for WindowsHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn identity(path: &Path) -> Result<WindowsFileIdentity> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .with_context(|| format!("open performance cleanup path identity {}", path.display()))?;
+        let handle = WindowsHandle(handle);
+        let mut file_id = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle.0,
+                FileIdInfo,
+                &mut file_id as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .with_context(|| format!("read performance cleanup path identity {}", path.display()))?;
+        Ok(WindowsFileIdentity {
+            volume_serial: file_id.VolumeSerialNumber,
+            file_id: file_id.FileId.Identifier,
+        })
+    }
+
+    Ok(identity(left)? == identity(right)?)
+}
+
+#[cfg(not(windows))]
+fn same_windows_file_identity(_left: &Path, _right: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 fn is_strict_descendant(path: &Path, parent: &Path) -> bool {
     let path = path_identity(path);
     let parent = path_identity(parent);
@@ -606,9 +690,7 @@ where
     {
         bail!("performance cleanup target is outside the owned temporary parent");
     }
-    if !same_path(target, &canonical_target) {
-        bail!("performance cleanup target uses an unresolved path alias");
-    }
+    validate_resolved_cleanup_identity_with(target, &canonical_target, same_windows_file_identity)?;
 
     let directory_name = target
         .file_name()
