@@ -4,6 +4,7 @@ All notable public changes to PureWall will be documented in this file.
 
 ## Unreleased
 
+- Updated the compatible Vitest, Browserslist, baseline mapping, and selector-parser dependency chain so the full npm audit reports no known vulnerabilities at repository initialization.
 - Fixed Windows path identity checks so DOS 8.3 short-name aliases are accepted only when the complete no-follow file identity chain matches, while noncanonical spellings, reparse paths, and replaced files or parent directories remain rejected.
 - Reframed the public README around PureWall's add → random Next → Like/Dislike loop, refreshed its six synthetic-data screenshots, and added a Windows install, verification, data-retention, and source-build guide. Completed npm, Cargo, and Tauri license/repository/publisher metadata, corrected the Tauri bundle category, and added monthly Dependabot coverage for npm, Cargo, and GitHub Actions.
 - Documented the repository-publication gate and the safe local unsigned packaging/evidence/cleanup workflow. A fresh x64 application EXE, NSIS installer, and MSI were built locally with updater artifacts disabled, retained outside version control with SHA-256 checksums, and explicitly remain unsigned non-release evidence. Ordinary CI now uses the same secret-free packaging boundary; tag releases retain the signed updater configuration.
