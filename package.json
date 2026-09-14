@@ -41,7 +41,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.5.1",
     "@vitejs/plugin-vue": "^6.0.7",
     "autoprefixer": "^10.4.0",
     "postcss": "^8.5.25",
