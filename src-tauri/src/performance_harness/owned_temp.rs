@@ -1016,6 +1016,32 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_root_keeps_its_short_name_registered_parent() {
+        let target = Path::new(
+            r"\\?\C:\Users\runneradmin\AppData\Local\Temp\purewall-performance\run-a",
+        );
+        let registered_parent =
+            Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\purewall-performance");
+
+        let matches = cleanup_target_has_registered_parent_with(
+            target,
+            registered_parent,
+            |actual_parent, expected_parent| {
+                assert_eq!(
+                    actual_parent,
+                    Path::new(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\purewall-performance")
+                );
+                assert_eq!(expected_parent, registered_parent);
+                Ok(true)
+            },
+        )
+        .expect("matching parent identity should be inspectable");
+
+        assert!(matches);
+    }
+
     #[test]
     fn cleanup_rejects_reparse_ancestor_and_wrong_physical_name() {
         let owned = OwnedRunRoot::create_for_test("naming").unwrap();
