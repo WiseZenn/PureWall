@@ -465,6 +465,20 @@ fn same_path(left: &Path, right: &Path) -> bool {
     path_identity(left) == path_identity(right)
 }
 
+fn same_resolved_cleanup_identity_with<F>(
+    registered: &Path,
+    resolved: &Path,
+    same_file: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path, &Path) -> Result<bool>,
+{
+    if same_path(registered, resolved) {
+        return Ok(true);
+    }
+    same_file(registered, resolved)
+}
+
 fn validate_resolved_cleanup_identity_with<F>(
     registered: &Path,
     resolved: &Path,
@@ -473,10 +487,24 @@ fn validate_resolved_cleanup_identity_with<F>(
 where
     F: FnOnce(&Path, &Path) -> Result<bool>,
 {
-    if same_path(registered, resolved) || same_file(registered, resolved)? {
+    if same_resolved_cleanup_identity_with(registered, resolved, same_file)? {
         return Ok(());
     }
     bail!("performance cleanup target uses an unresolved path alias");
+}
+
+fn cleanup_target_has_registered_parent_with<F>(
+    target: &Path,
+    registered_parent: &Path,
+    same_file: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path, &Path) -> Result<bool>,
+{
+    let Some(actual_parent) = target.parent() else {
+        return Ok(false);
+    };
+    same_resolved_cleanup_identity_with(actual_parent, registered_parent, same_file)
 }
 
 #[cfg(windows)]
@@ -678,15 +706,18 @@ where
             target.display()
         )
     })?;
+    let has_registered_parent = cleanup_target_has_registered_parent_with(
+        target,
+        &fixed_parent,
+        same_windows_file_identity,
+    )?;
 
     if !is_strict_descendant(&canonical_parent, &canonical_temp)
         || !is_strict_descendant(&canonical_target, &canonical_parent)
         || canonical_target
             .parent()
             .is_none_or(|parent| !same_path(parent, &canonical_parent))
-        || target
-            .parent()
-            .is_none_or(|parent| !same_path(parent, &fixed_parent))
+        || !has_registered_parent
     {
         bail!("performance cleanup target is outside the owned temporary parent");
     }
@@ -1019,9 +1050,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_canonical_root_keeps_its_short_name_registered_parent() {
-        let target = Path::new(
-            r"\\?\C:\Users\runneradmin\AppData\Local\Temp\purewall-performance\run-a",
-        );
+        let target =
+            Path::new(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\purewall-performance\run-a");
         let registered_parent =
             Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\purewall-performance");
 
