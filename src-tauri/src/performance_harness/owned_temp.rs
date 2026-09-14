@@ -903,6 +903,37 @@ mod tests {
         owned.cleanup().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_name_spelling_is_accepted_when_file_identity_matches() {
+        let registered =
+            Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\purewall-performance\run-a");
+        let resolved =
+            Path::new(r"C:\Users\RUNNER~1\AppData\Local\Temp\purewall-performance\run-a");
+
+        validate_resolved_cleanup_identity_with(registered, resolved, |left, right| {
+            assert_eq!(left, registered);
+            assert_eq!(right, resolved);
+            Ok(true)
+        })
+        .expect("matching Windows file identity should accept a DOS short-name spelling");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_different_file_identity_remains_rejected() {
+        let registered = Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\run-a");
+        let resolved = Path::new(r"C:\Users\runneradmin\AppData\Local\Temp\run-b");
+
+        let error = validate_resolved_cleanup_identity_with(registered, resolved, |_, _| Ok(false))
+            .expect_err("different Windows file identity must remain fail-closed");
+
+        assert_eq!(
+            error.to_string(),
+            "performance cleanup target uses an unresolved path alias"
+        );
+    }
+
     #[test]
     fn cleanup_rejects_reparse_ancestor_and_wrong_physical_name() {
         let owned = OwnedRunRoot::create_for_test("naming").unwrap();
