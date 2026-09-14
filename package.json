@@ -2,6 +2,17 @@
   "name": "purewall",
   "private": true,
   "version": "0.1.0",
+  "description": "A local-first Windows wallpaper manager for browsing, organizing, and rotating personal wallpaper libraries.",
+  "license": "MIT",
+  "author": "PureWall contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WiseZenn/PureWall.git"
+  },
+  "homepage": "https://github.com/WiseZenn/PureWall#readme",
+  "bugs": {
+    "url": "https://github.com/WiseZenn/PureWall/issues"
+  },
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"

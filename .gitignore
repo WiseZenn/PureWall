@@ -20,7 +20,14 @@ Thumbs.db
 
 # Environment
 .env
-.env.local
+.env.*
+!.env.example
+
+# Package-manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Local agent configuration
 /.agents/
@@ -37,9 +44,7 @@ src-tauri/$c/
 # Local browser QA evidence
 output/playwright/
 
-# Local agent config / caches
-.agents/
-.codex/
+# Local caches
 scripts/__pycache__/
 *.pyc
 
@@ -49,7 +54,6 @@ scripts/__pycache__/
 *.pem
 *.key
 src-tauri/tauri.release.generated.conf.json
-
 
 # pi-subagents runtime state
 .pi-subagents/

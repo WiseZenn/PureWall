@@ -2,6 +2,13 @@
 name = "purewall"
 version = "0.1.0"
 edition = "2021"
+authors = ["PureWall contributors"]
+description = "A local-first Windows wallpaper manager"
+license = "MIT"
+repository = "https://github.com/WiseZenn/PureWall"
+homepage = "https://github.com/WiseZenn/PureWall"
+readme = "../README.md"
+publish = false
 
 [features]
 default = []

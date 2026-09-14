@@ -13,6 +13,18 @@ This guide is for maintainers preparing a Windows release. It describes the repo
 
 Before a first release, obtain the first green run of `.github/workflows/ci.yml`, confirm GitHub Private Vulnerability Reporting is available, and complete the review gate in [SECURITY.md](../SECURITY.md).
 
+Ordinary CI deliberately builds unsigned installers with updater artifacts disabled, so it does not receive release signing secrets. Only the tag-driven release workflow generates the signing configuration and updater artifacts.
+
+## Repository publication gate
+
+Before making the repository public, confirm that the intended `WiseZenn/PureWall` repository exists and that `origin` points to it. Configure the repository description, topics, social preview, Discussions, and the default branch protection rules.
+
+Review GitHub's Community Standards page. `README.md`, `LICENSE`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `SUPPORT.md`, and the issue/PR templates must all be detected from the default branch.
+
+Run a secret scan and inspect the source archive from a clean clone. Local agent files, build output, AppData, signing material, QA captures, and release candidates must remain untracked under the boundaries in [REPOSITORY_POLICY.md](REPOSITORY_POLICY.md).
+
+Review the resolved npm and Cargo dependency licenses. Any third-party notice required by a bundled component must ship with the matching installer or release assets; a project-level MIT license does not replace third-party terms.
+
 ## Required GitHub Actions configuration
 
 Provision these **secrets**. Store values only in GitHub Actions; never commit them or print them in logs:
@@ -111,3 +123,25 @@ powershell -ExecutionPolicy Bypass -File scripts/verify-install-lifecycle.ps1 -S
 ```
 
 See [ROADMAP.md](../ROADMAP.md) for the current evidence status. Until an authorized tag produces a reviewed matching release, signing, updater delivery, provenance, installer smoke, and publication remain pending.
+
+## Local unsigned packaging and cleanup
+
+Use this only to prove that Windows packaging works without release credentials:
+
+```powershell
+npm run tauri build -- --bundles nsis,msi --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+The command produces `src-tauri\target\release\purewall.exe` plus NSIS and MSI installers below `src-tauri\target\release\bundle\`. They are local unsigned candidates, not GitHub release assets.
+
+Before cleaning, copy the exact candidate files and `LICENSE` into an ignored subdirectory under `release-artifacts\`. Record the source commit, dirty-tree state, toolchain, Authenticode status, and a SHA-256 line for every retained file.
+
+Verify the copied hashes before removing reproducible intermediates. Then use the narrow project paths below:
+
+```powershell
+cargo clean --manifest-path src-tauri/Cargo.toml
+Remove-Item -LiteralPath .\dist -Recurse -Force
+git clean -fX -- NUL
+```
+
+Never clean `node_modules`, AppData, a wallpaper library, agent memory, or an unverified path as part of this release-output cleanup. The ignored `release-artifacts\` evidence directory must survive.

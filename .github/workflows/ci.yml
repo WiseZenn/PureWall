@@ -56,4 +56,6 @@ jobs:
       - run: cargo build --release
         working-directory: src-tauri
 
-      - run: npm run tauri build
+      # Ordinary CI proves unsigned packaging without release signing secrets.
+      # Tag releases use the generated signed configuration in release.yml.
+      - run: npm run tauri build -- --config '{"bundle":{"createUpdaterArtifacts":false}}'
