@@ -29,7 +29,7 @@
     "verify:release": "node scripts/verify-release-contract.mjs"
   },
   "dependencies": {
-    "@fluentui/svg-icons": "^1.1.330",
+    "@fluentui/svg-icons": "^1.1.340",
     "@fontsource-variable/geist": "^5.2.9",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
