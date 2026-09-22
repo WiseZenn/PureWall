@@ -30,7 +30,7 @@ sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 notify = "7"
 image = "0.25"
-dirs = "6"
+dirs = "7"
 fastrand = "2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
