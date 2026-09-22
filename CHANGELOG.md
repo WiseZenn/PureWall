@@ -1,0 +1,38 @@
+# Changelog
+
+All notable public changes to PureWall will be documented in this file.
+
+## Unreleased
+
+- Updated the compatible Vitest, Browserslist, baseline mapping, selector-parser, and `serde_with` dependency chain so npm reports no known vulnerabilities and the actionable Rust advisory is patched at repository initialization.
+- Fixed Windows path identity checks so DOS 8.3 short-name aliases are accepted only when the complete no-follow file identity chain matches, while noncanonical spellings, reparse paths, and replaced files or parent directories remain rejected.
+- Fixed the performance harness cleanup guard on GitHub-hosted Windows runners by comparing the underlying volume and file ID when canonicalization changes only the long/short path spelling; lexical aliases, different objects, reparse paths, ownership markers, and cleanup containment remain fail closed.
+- Reframed the public README around PureWall's add → random Next → Like/Dislike loop, refreshed its six synthetic-data screenshots, and added a Windows install, verification, data-retention, and source-build guide. Completed npm, Cargo, and Tauri license/repository/publisher metadata, corrected the Tauri bundle category, and added monthly Dependabot coverage for npm, Cargo, and GitHub Actions.
+- Documented the repository-publication gate and the safe local unsigned packaging/evidence/cleanup workflow. A fresh x64 application EXE, NSIS installer, and MSI were built locally with updater artifacts disabled, retained outside version control with SHA-256 checksums, and explicitly remain unsigned non-release evidence. Ordinary CI now uses the same secret-free packaging boundary; tag releases retain the signed updater configuration.
+- Fixed the stage playback dock so Like/Dislike always targets the wallpaper visibly displayed on the stage, even when it differs from the desktop current wallpaper. Active ratings can now be cleared by pressing the same control again, opposite ratings switch directly, and one pending dock action blocks accidental duplicate command bursts. Weighted random selection and non-stage playback entry points are unchanged.
+- Added feature-gated, ignored native Windows watcher lifecycle coverage for nested create/modify/rename/remove delivery through the production queue, post-drop quiescence, and real junction traversal rejection. The tests can run only through a manual, timeout-bounded GitHub-hosted Windows workflow with an owned temporary-root marker; implementation is not evidence that the external workflow has passed.
+- Optimized 10,000-item full-folder scanning by canonicalizing safe roots once, reusing verified Windows entry metadata, and caching dimensions for hard-linked physical files within a scan. Two same-commit Standard runs improved the selected `scan.full` median by 88.57% and 90.22%. Their complete machine comparisons remained `regressed` because changing unrelated scenarios exceeded the 5% guardrail under sustained background load; the maintainer explicitly accepted this documented local-environment exception. No successful Stress result is claimed.
+- Added a feature-gated, pre-Tauri performance harness with deterministic synthetic datasets, production-path scanner/database/playback/media scenarios, strict JSON and Markdown reports, fail-closed comparison gates, and a small 120-item CI contract. Stress results are not claimed until that workflow is explicitly run.
+- Hardened watched-folder synchronization with pure `EventKind` classification, component-aware root containment, source-owned bounded coalescing, unique-path capacity accounting, two-worker fairness, and deterministic shutdown. Ordinary directory metadata changes stay incremental; notify loss and per-source path saturation promote to a bounded snapshot, while new roots beyond the global admission limit fail closed. Per-admission generation tokens preserve one in-flight slot across remove/re-admit races, and stale completions cannot release replacement work. Startup, import, manual, relocation-handoff, and watcher full snapshots atomically authorize ownership, mark absent descendants unavailable, upsert images, and persist scan state without deleting metadata or relationships. Stale source work and outside-root missing paths are no-ops, stale work emits no success refresh, Windows traversal rejects reparse roots and descendants, and source-identified failures refresh the UI once per unresolved episode. Shutdown drops native watchers before joining the reconciliation queue and checkpoints SQLite last.
+- Hardened wallpaper deletion: only exact registered local fixed-volume files may proceed through a project-owned Windows Shell Recycle Bin operation; reparse/remote/unsupported-volume paths and unsupported platforms fail closed, Recycle Bin evidence is required before metadata cleanup, and PureWall never auto-confirms permanent deletion. The Windows Shell path-bound same-user replacement residual remains explicitly documented rather than claimed eliminated.
+- Hardened SQLite startup recovery: older supported databases pass `quick_check`, receive a retained WAL-safe adjacent migration backup, and migrate transactionally with fail-closed collision handling; PureWall never auto-restores or deletes safety copies.
+- Preparing PureWall for its first open-source Windows release.
+- Added release-readiness documentation and a staged implementation plan.
+- Added Windows MSI and NSIS packaging verification.
+- Added initial safety regression tests for scanner, SQLite, context-menu, and autostart boundaries.
+- Added public project documentation: README, license, security policy, contributing guide, and changelog.
+- Added a Windows GitHub Actions CI workflow for typecheck, build, Rust fmt/check/test/clippy, and production dependency audit.
+- Documented safe uninstall cleanup scope for PureWall-owned HKCU registry entries.
+- The release collector covers MSI/NSIS setup artifacts, updater `.sig` artifact(s), and `latest.json`; PureWall does not claim a standalone portable executable.
+- Added an executable release contract (`npm run verify:release`) that gates version/tag drift, HTTPS updater endpoints, and release/smoke workflow structure.
+- Added a signature-verified update path: Settings can check for updates, review release notes, and explicitly download/install; updates require HTTPS transport and Tauri signature verification.
+- Added tag-driven release automation that builds, signs, checksums, and attests Windows artifacts and creates only a draft GitHub Release.
+- Added installer lifecycle smoke coverage (clean install, optional upgrade, uninstall, Authenticode, registry ownership) scoped to disposable runners.
+- Resolved the last high-severity advisory (nanoid) so `npm audit` reports 0 vulnerabilities.
+- Rewrote the public README with product screenshots, feature highlights, a safety promise, and an honest project-status section.
+- Added a GitHub social preview banner and reproducible screenshot/marketing generation scripts.
+- Added a public engineering architecture doc and a maintainer release guide (`docs/RELEASING.md`).
+- Moved internal agent memory, planning docs, and raw design candidates out of public version control (kept locally).
+- Pinned GitHub Actions to reviewed commit SHAs and hardened release/installer-smoke workflows (strict tag validation, runner guards, checksum + attestation for upgrade MSI).
+- Fixed frontend interaction bugs: icon-button clicks, keyboard activation on nested card controls, and rotation-interval rollback on backend rejection.
+- Made play counting transactional and applied the 500-path batch limit to batch deletion.

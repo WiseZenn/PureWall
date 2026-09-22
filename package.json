@@ -1,0 +1,55 @@
+{
+  "name": "purewall",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A local-first Windows wallpaper manager for browsing, organizing, and rotating personal wallpaper libraries.",
+  "license": "MIT",
+  "author": "PureWall contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WiseZenn/PureWall.git"
+  },
+  "homepage": "https://github.com/WiseZenn/PureWall#readme",
+  "bugs": {
+    "url": "https://github.com/WiseZenn/PureWall/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "test:unit": "vitest run --exclude scripts/qa-screenshots.test.mjs",
+    "test:performance-harness": "cargo test --manifest-path src-tauri/Cargo.toml --features performance-harness performance_harness -- --nocapture",
+    "test:release-contract": "node scripts/verify-release-contract.mjs --self-test",
+    "qa:screenshots": "npm run build && node scripts/qa-screenshots.mjs && node --test scripts/qa-screenshots.test.mjs",
+    "verify:release": "node scripts/verify-release-contract.mjs"
+  },
+  "dependencies": {
+    "@fluentui/svg-icons": "^1.1.330",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "@vueuse/core": "^14.3.0",
+    "pinia": "^3.0.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.5.25",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.6.0",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.8",
+    "yaml": "^2.9.0"
+  }
+}

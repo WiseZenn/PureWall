@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">PureWall app icon</title>
+  <desc id="desc">A stack of wallpaper cards with a blue next action mark.</desc>
+  <defs>
+    <linearGradient id="base" x1="38" y1="18" x2="218" y2="238" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fbfdff"/>
+      <stop offset="1" stop-color="#edf6ff"/>
+    </linearGradient>
+    <linearGradient id="photo" x1="76" y1="70" x2="176" y2="190" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6bb8f1"/>
+      <stop offset=".56" stop-color="#b8dcf8"/>
+      <stop offset="1" stop-color="#f4faff"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="190" y1="100" x2="190" y2="170" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#238be6"/>
+      <stop offset="1" stop-color="#096fc8"/>
+    </linearGradient>
+    <clipPath id="wallpaper-clip">
+      <rect x="70" y="66" width="124" height="124" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g id="logo">
+    <rect id="base-plate" x="8" y="8" width="240" height="240" rx="54" fill="url(#base)"/>
+    <rect id="base-border" x="10" y="10" width="236" height="236" rx="52" fill="none" stroke="#d3e5f7" stroke-width="3"/>
+
+    <rect id="back-card" x="43" y="48" width="128" height="124" rx="28" fill="#e3f1ff"/>
+    <rect id="mid-card" x="56" y="57" width="128" height="124" rx="28" fill="#fbfdff" stroke="#d6e6f7" stroke-width="3"/>
+
+    <g id="wallpaper-card">
+      <rect x="70" y="66" width="124" height="124" rx="28" fill="url(#photo)"/>
+      <g clip-path="url(#wallpaper-clip)">
+        <circle id="wallpaper-sun" cx="101" cy="96" r="11" fill="#238be6"/>
+        <path id="wallpaper-snow" d="M70 144 L103 116 L132 143 L154 124 L194 158 L194 190 L70 190 Z" fill="#ffffff" opacity=".94"/>
+        <path id="wallpaper-ridge" d="M70 160 L110 134 L140 158 L160 144 L194 166 L194 190 L70 190 Z" fill="#4a6f91" opacity=".62"/>
+      </g>
+      <rect x="70" y="66" width="124" height="124" rx="28" fill="none" stroke="#4a6f91" stroke-width="6"/>
+    </g>
+
+    <path id="next-chevron" d="M188 111 L207 128 L188 145" fill="none" stroke="url(#accent)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose an improvement to an existing local PureWall workflow.
+title: "[Feature]: "
+labels: []
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Existing PureWall workflow
+      description: Which current workflow would this improve, such as importing, browsing, rating, rotation, collections, metadata backup, or local Windows integration?
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the user problem without prescribing a large redesign.
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired behavior
+      description: What observable result would make the existing workflow better?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Share any workaround or smaller option you tried.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      description: PureWall-X and online wallpaper feeds are deferred from the PureWall foundation.
+      options:
+        - label: This request improves an existing local PureWall workflow and does not require PureWall-X or an online feed.
+          required: true

@@ -1,0 +1,77 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Tauri build
+src-tauri/target/
+release-artifacts/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.worktrees/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Package-manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local agent configuration
+/.agents/
+/.codex/
+/skills-lock.json
+
+# Language/tool caches
+**/__pycache__/
+*.py[cod]
+
+# Local registry-script residue
+src-tauri/$c/
+
+# Local browser QA evidence
+output/playwright/
+
+# Local caches
+scripts/__pycache__/
+*.pyc
+
+# Generated QA and signing residue
+/output/
+*.pfx
+*.pem
+*.key
+src-tauri/tauri.release.generated.conf.json
+
+# pi-subagents runtime state
+.pi-subagents/
+/.pi/
+/NUL
+
+# Local project memory and agent workflows (internal, kept local)
+/AGENTS.md
+/prompt/
+/docs/project-docs/
+/docs/superpowers/
+/.superpowers/
+/PureWall - 桌面壁纸美学管家 开发计划.md
+
+# Raw/internal design candidates
+/design/ChatGPT Image*.png
+/design/ig_*.png
+/design/已生成图像*.png
+/design/PureWall-Living-Gallery-Fusion.*
+/design/purewall-icon-motion-spec.md
+/design/purewall-icon-motion.html

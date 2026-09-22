@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: PureWall support guide
+    url: https://github.com/WiseZenn/PureWall/blob/main/SUPPORT.md
+    about: Choose the correct channel for setup help, usage questions, or reproducible bugs.
+  - name: Security reporting policy
+    url: https://github.com/WiseZenn/PureWall/blob/main/SECURITY.md
+    about: Read the private-reporting boundary before sharing files, registry, installer, traversal, or update-signature findings.
